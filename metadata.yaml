@@ -1,0 +1,10 @@
+name: astrbot_plugin_jmdownloader
+display_name: JM 漫画下载器
+version: v1.0.0
+author: JustMonika
+desc: 支持章节选择、页数限制、缓存与 AES-256 加密的 JM 漫画下载插件
+short_desc: 在 QQ 群聊或私聊中下载 JM 漫画并发送 AES-256 加密 PDF 压缩包。
+repo: https://github.com/JustMonika24769/astrbot_plugin_jmdownloader
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.26,<5"

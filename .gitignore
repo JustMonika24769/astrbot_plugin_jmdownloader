@@ -1,0 +1,61 @@
+# Upstream source checked out for local reference only.
+JMComic-Crawler-Python/
+
+# Python bytecode and caches.
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.hypothesis/
+
+# Test and coverage output.
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+pytest.xml
+
+# Virtual environments and local package metadata.
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+*.egg-info/
+pip-wheel-metadata/
+
+# Build and packaging output.
+build/
+dist/
+*.whl
+*.tar.gz
+*.zip
+*.7z
+
+# AstrBot runtime data and local development state.
+data/
+logs/
+*.log
+.agents/
+.codex/
+.config-test/
+.final-config-test/
+
+# IDE and editor files.
+.idea/
+.vscode/
+*.iml
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Operating-system files.
+.DS_Store
+Thumbs.db
+Desktop.ini

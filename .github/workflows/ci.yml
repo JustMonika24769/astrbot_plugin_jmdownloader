@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Lint
+        run: python -m ruff check main.py jm_service.py tests
+      - name: Test
+        run: python -m pytest
+      - name: Compile
+        run: python -m py_compile main.py jm_service.py
+      - name: Package
+        shell: pwsh
+        run: .\scripts\package.ps1

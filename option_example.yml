@@ -1,0 +1,39 @@
+log: true
+client:
+  cache: null
+  domain: 
+    # - jmcomic-zzz.org
+    # - 18comic.vip
+    - jmcomic-zzz.one
+    # - 18comic-mygo.org
+    # - 18comic.org
+    # - 18comic-mygo.vip
+    # - 18comic-MHWs.CC
+  impl: html
+  postman:
+    meta_data:
+      headers: null
+      impersonate: chrome110
+      proxies: {}
+      cookies: {}
+    type: cffi
+  retry_times: 5
+dir_rule:
+  base_dir: /var/jmcomic/download
+  rule: Bd_Aid_Pid
+download:
+  cache: true
+  image:
+    suffix: .jpg
+  threading:
+    image: 15
+    photo: 2
+log: true
+plugins:
+  valid: log
+  after_album:
+    - plugin: img2pdf
+      kwargs:
+        pdf_dir: /var/jmcomic/download/pdf
+        filename_rule: Aid
+version: '2.1'

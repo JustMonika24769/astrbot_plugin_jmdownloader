@@ -1,0 +1,224 @@
+{
+  "zip_password": {
+    "type": "string",
+    "description": "压缩包密码",
+    "hint": "必填，至少 8 个字符。生成的 ZIP 使用 AES-256 加密，密码不会发送到聊天中。修改密码后已有缓存会通过实际解密校验自动失效。",
+    "default": ""
+  },
+  "archive_dir": {
+    "type": "string",
+    "description": "压缩包缓存/上传目录",
+    "hint": "最终 ZIP 文件保存的位置，也就是 AstrBot 发送文件时读取的本地路径。留空使用插件数据目录下的 archives；相对路径按插件数据目录解析。",
+    "default": ""
+  },
+  "duplicate_cooldown_seconds": {
+    "type": "int",
+    "description": "重复请求冷却时间（秒）",
+    "hint": "同一会话重复请求同一个 JM 号时，在此时间内不重复发送缓存文件。设为 0 表示关闭冷却。",
+    "slider": {
+      "min": 0,
+      "max": 600,
+      "step": 10
+    },
+    "default": 30
+  },
+  "max_concurrent_downloads": {
+    "type": "int",
+    "description": "最大同时下载数",
+    "hint": "控制后台 JM 下载任务的并发数。建议保持 1，避免占满带宽或触发站点限制。",
+    "slider": {
+      "min": 1,
+      "max": 4,
+      "step": 1
+    },
+    "default": 1
+  },
+  "max_queue_size": {
+    "type": "int",
+    "description": "最大任务队列长度",
+    "hint": "限制正在检查、下载或发送的任务总数，防止大量不同 JM 号耗尽内存、磁盘和带宽。",
+    "slider": {
+      "min": 1,
+      "max": 50,
+      "step": 1
+    },
+    "default": 10
+  },
+  "max_active_requests_per_session": {
+    "type": "int",
+    "description": "单会话最大活动请求数",
+    "hint": "限制同一个群聊或私聊同时保留的不同下载任务数量。重复请求同一任务仍会自动合并。",
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    },
+    "default": 2
+  },
+  "max_chapters_per_download": {
+    "type": "int",
+    "description": "单次下载最大章节数",
+    "hint": "本子章节数超过此值时，插件会先列出章节并等待用户选择；用户选择的章节数也不能超过此值。设为 0 表示不限制且直接下载全部章节。此项不限制图片页数。",
+    "slider": {
+      "min": 0,
+      "max": 200,
+      "step": 1
+    },
+    "default": 20
+  },
+  "max_pages_per_download": {
+    "type": "int",
+    "description": "单次下载最大图片页数",
+    "hint": "独立于章节数限制。按章节编号顺序累计下载图片，达到此页数后停止，后续页面和章节不再下载。设为 0 表示不限制页数。",
+    "slider": {
+      "min": 0,
+      "max": 2000,
+      "step": 10
+    },
+    "default": 80
+  },
+  "chapter_selection_timeout_seconds": {
+    "type": "int",
+    "description": "章节选择等待时间（秒）",
+    "hint": "超过章节限制后，用户需要在此时间内回复章节范围；默认 10 分钟。",
+    "slider": {
+      "min": 60,
+      "max": 3600,
+      "step": 60
+    },
+    "default": 600
+  },
+  "client": {
+    "type": "object",
+    "description": "JM 客户端配置",
+    "hint": "对应 JMComic-Crawler-Python 的 client 配置。",
+    "items": {
+      "domain": {
+        "type": "list",
+        "description": "JM 域名列表",
+        "hint": "按顺序填写可用域名，不要包含 http:// 或路径。默认值来自 option_example.yml。",
+        "default": [
+          "jmcomic-zzz.one"
+        ]
+      },
+      "impl": {
+        "type": "string",
+        "description": "客户端实现",
+        "hint": "html 使用网页端，api 使用移动端接口；按站点可用性选择。",
+        "options": [
+          "html",
+          "api"
+        ],
+        "default": "html"
+      },
+      "retry_times": {
+        "type": "int",
+        "description": "请求重试次数",
+        "default": 5,
+        "slider": {
+          "min": 0,
+          "max": 10,
+          "step": 1
+        }
+      },
+      "cookies": {
+        "type": "text",
+        "description": "JM Cookie",
+        "hint": "默认留空。可填写 JSON，例如 {\"AVS\":\"...\"}，也可填写 Cookie 请求头格式：AVS=...; remember=...。",
+        "default": ""
+      },
+      "proxies": {
+        "type": "text",
+        "description": "请求代理",
+        "hint": "可留空。可填写 JSON，例如 {\"http\":\"http://127.0.0.1:7890\",\"https\":\"http://127.0.0.1:7890\"}。",
+        "default": "{}"
+      },
+      "impersonate": {
+        "type": "string",
+        "description": "浏览器指纹",
+        "hint": "传给 curl-cffi 的 impersonate 配置，默认使用示例文件中的 chrome110。",
+        "default": "chrome110"
+      }
+    }
+  },
+  "dir_rule": {
+    "type": "object",
+    "description": "JM 下载目录规则",
+    "hint": "对应 JMComic-Crawler-Python 的 dir_rule。base_dir 留空时使用插件数据目录下的 downloads。",
+    "items": {
+      "base_dir": {
+        "type": "string",
+        "description": "下载工作目录",
+        "default": ""
+      },
+      "rule": {
+        "type": "string",
+        "description": "目录规则",
+        "hint": "JMComic-Crawler-Python 的目录规则 DSL。为避免多章共用目录造成图片覆盖和 PDF 重复嵌入，插件会在任务内部自动补充 Pid 章节目录。",
+        "default": "Bd_Aid_Pid"
+      },
+      "normalize_zh": {
+        "type": "string",
+        "description": "繁简体归一化",
+        "hint": "可填写 zh-cn 或 zh-tw，留空表示不转换。",
+        "default": ""
+      }
+    }
+  },
+  "download": {
+    "type": "object",
+    "description": "JM 下载配置",
+    "hint": "对应 JMComic-Crawler-Python 的 download 配置。",
+    "items": {
+      "cache": {
+        "type": "bool",
+        "description": "图片下载缓存",
+        "hint": "上游下载器的图片缓存开关；插件自身还会检查最终 ZIP 缓存。",
+        "default": true
+      },
+      "image": {
+        "type": "object",
+        "description": "图片配置",
+        "items": {
+          "suffix": {
+            "type": "string",
+            "description": "图片后缀",
+            "default": ".jpg"
+          }
+        }
+      },
+      "threading": {
+        "type": "object",
+        "description": "下载线程",
+        "items": {
+          "image": {
+            "type": "int",
+            "description": "图片并发数",
+            "default": 15,
+            "slider": {
+              "min": 1,
+              "max": 50,
+              "step": 1
+            }
+          },
+          "photo": {
+            "type": "int",
+            "description": "章节并发数",
+            "default": 2,
+            "slider": {
+              "min": 1,
+              "max": 10,
+              "step": 1
+            }
+          }
+        }
+      }
+    }
+  },
+  "plugins": {
+    "type": "text",
+    "description": "JM 插件配置",
+    "hint": "高级选项。填写 JMComic-Crawler-Python plugins 的 YAML 或 JSON，仅应启用可信插件。为确保章节和页数限制严格生效，after_album/img2pdf 项会被移除，PDF 由本插件根据本次实际下载的精确图片清单生成。",
+    "default": "valid: log"
+  }
+}
