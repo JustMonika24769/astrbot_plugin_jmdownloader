@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import re
@@ -12,10 +13,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+try:
+    from .runtime_store import RuntimeStore
+except ImportError:  # pragma: no cover - supports direct test imports
+    from runtime_store import RuntimeStore
+
 JM_ID_RE = re.compile(r"^(?:jm)?([0-9]+)$", re.IGNORECASE)
 DEFAULT_DOMAIN = ["jmcomic-zzz.one"]
 DEFAULT_DIR_RULE = "Bd_Aid_Pid"
-CACHE_FORMAT_VERSION = 5
+CACHE_FORMAT_VERSION = 6
 MIN_ZIP_PASSWORD_LENGTH = 8
 CHAPTERS_PER_FORWARD_NODE = 50
 MAX_FORWARD_NODES = 99
@@ -24,6 +30,7 @@ MAX_ERROR_SUMMARY_LENGTH = 1000
 MAX_JM_ID_DIGITS = 18
 MAX_CHAPTER_SELECTION_LENGTH = 4096
 MAX_CHAPTER_NUMBER_DIGITS = 9
+MAX_DOMAIN_COUNT = 20
 SENSITIVE_ERROR_RE = re.compile(
     r"(?i)\b(cookies?|authorization|proxy-authorization|avs|remember|password|token)"
     r"(\s*[:=]\s*)([^\s,;]+)"
@@ -53,6 +60,7 @@ class ChapterSelectionResult:
 class Requester:
     event: Any
     session: str
+    user_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -76,6 +84,7 @@ class Job:
     selection: tuple[int, ...] | None = None
     requesters: list[Requester] = field(default_factory=list)
     task: asyncio.Task | None = None
+    created_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass(frozen=True)
@@ -85,6 +94,8 @@ class PdfBuildResult:
     pdf_pages: int
     chapter_limit: int
     page_limit: int
+    source_image_bytes: int
+    pdf_bytes: int
 
 
 @dataclass
@@ -100,6 +111,21 @@ class JmSettings:
     max_chapters_per_download: int
     max_pages_per_download: int
     chapter_selection_timeout_seconds: int
+    user_rate_limit_requests: int
+    user_rate_limit_window_seconds: int
+    user_daily_download_limit: int
+    user_daily_traffic_mb: int
+    plugin_admin_qq_ids: frozenset[str]
+    domain_health_check_enabled: bool
+    domain_health_check_interval_minutes: int
+    domain_health_check_timeout_seconds: int
+    pdf_compression_enabled: bool
+    pdf_jpeg_quality: int
+    pdf_max_width: int
+    cache_max_size_mb: int
+    cache_expire_days: int
+    cache_cleanup_interval_minutes: int
+    structured_log_retention_days: int
     client: dict[str, Any]
     dir_rule: dict[str, Any]
     download: dict[str, Any]
@@ -175,6 +201,45 @@ class JmSettings:
             chapter_selection_timeout_seconds=max(
                 60, _as_int(config.get("chapter_selection_timeout_seconds"), 600)
             ),
+            user_rate_limit_requests=max(
+                0, _as_int(config.get("user_rate_limit_requests"), 5)
+            ),
+            user_rate_limit_window_seconds=max(
+                1, _as_int(config.get("user_rate_limit_window_seconds"), 60)
+            ),
+            user_daily_download_limit=max(
+                0, _as_int(config.get("user_daily_download_limit"), 0)
+            ),
+            user_daily_traffic_mb=max(
+                0, _as_int(config.get("user_daily_traffic_mb"), 0)
+            ),
+            plugin_admin_qq_ids=frozenset(
+                _parse_identifier_list(config.get("plugin_admin_qq_ids"))
+            ),
+            domain_health_check_enabled=bool(
+                config.get("domain_health_check_enabled", True)
+            ),
+            domain_health_check_interval_minutes=max(
+                5, _as_int(config.get("domain_health_check_interval_minutes"), 30)
+            ),
+            domain_health_check_timeout_seconds=max(
+                2, _as_int(config.get("domain_health_check_timeout_seconds"), 10)
+            ),
+            pdf_compression_enabled=bool(
+                config.get("pdf_compression_enabled", False)
+            ),
+            pdf_jpeg_quality=min(
+                95, max(20, _as_int(config.get("pdf_jpeg_quality"), 75))
+            ),
+            pdf_max_width=max(0, _as_int(config.get("pdf_max_width"), 1600)),
+            cache_max_size_mb=max(0, _as_int(config.get("cache_max_size_mb"), 0)),
+            cache_expire_days=max(0, _as_int(config.get("cache_expire_days"), 0)),
+            cache_cleanup_interval_minutes=max(
+                5, _as_int(config.get("cache_cleanup_interval_minutes"), 60)
+            ),
+            structured_log_retention_days=max(
+                1, _as_int(config.get("structured_log_retention_days"), 30)
+            ),
             client=client,
             dir_rule=dir_rule,
             download=download,
@@ -183,28 +248,90 @@ class JmSettings:
 
 
 class DownloadCoordinator:
-    def __init__(self, settings: JmSettings, logger: Any):
+    def __init__(
+        self,
+        settings: JmSettings,
+        logger: Any,
+        store: RuntimeStore | None = None,
+    ):
         self.settings = settings
         self.logger = logger
+        self.store = store or RuntimeStore(settings.data_dir / "runtime.sqlite3")
         self._lock = asyncio.Lock()
+        self._health_lock = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
         self._jobs: dict[str, Job] = {}
         self._pending_selections: dict[str, PendingSelection] = {}
         self._last_delivery: dict[tuple[str, str], float] = {}
+        self._background_tasks: list[asyncio.Task] = []
+        self._started = False
 
-    async def submit(self, event: Any, raw_jm_id: str) -> SubmitResult:
-        jm_id = normalize_jm_id(raw_jm_id)
-        if jm_id is None:
-            return SubmitResult("用法：/本子 <jm号>，例如 /本子 jm123456 或 /本子 123456")
-        if not self.settings.zip_password:
-            return SubmitResult("插件尚未配置压缩包密码，请先在插件配置页填写。")
-        if len(self.settings.zip_password) < MIN_ZIP_PASSWORD_LENGTH:
-            return SubmitResult(
-                f"压缩包密码至少需要 {MIN_ZIP_PASSWORD_LENGTH} 个字符，请在插件配置页修改。"
+    async def start(self):
+        if self._started:
+            return
+        self._started = True
+        self.store.prune(self.settings.structured_log_retention_days)
+        self._background_tasks.append(asyncio.create_task(self._cache_cleanup_loop()))
+        if self.settings.domain_health_check_enabled:
+            self._background_tasks.append(
+                asyncio.create_task(self._domain_health_loop())
             )
 
+    def _submission_error(self, jm_id: str | None) -> str | None:
+        if jm_id is None:
+            return "用法：/本子 <jm号>，例如 /本子 jm123456 或 /本子 123456"
+        if not self.settings.zip_password:
+            return "插件尚未配置压缩包密码，请先在插件配置页填写。"
+        if len(self.settings.zip_password) < MIN_ZIP_PASSWORD_LENGTH:
+            return (
+                f"压缩包密码至少需要 {MIN_ZIP_PASSWORD_LENGTH} 个字符，"
+                "请在插件配置页修改。"
+            )
+        return None
+
+    def _rate_limit_error(self, requester: Requester, jm_id: str) -> str | None:
+        result = self.store.check_and_record_rate(
+            requester.user_id,
+            self.settings.user_rate_limit_requests,
+            self.settings.user_rate_limit_window_seconds,
+        )
+        if result.allowed:
+            return None
+        self.store.record_event(
+            "request_rejected",
+            level="warning",
+            success=False,
+            jm_id=jm_id,
+            user_id=requester.user_id,
+            session=requester.session,
+            reason="用户速率限制",
+        )
+        return result.message
+
+    def _validated_selection(
+        self, raw_selection: str, total_chapters: int
+    ) -> tuple[tuple[int, ...] | None, str | None]:
+        selection = parse_chapter_selection(raw_selection, total_chapters)
+        if selection is None:
+            return None, "章节格式不正确，请回复类似 1-3,5 的章节编号。"
+        limit = self.settings.max_chapters_per_download
+        if limit > 0 and len(selection) > limit:
+            return None, f"本次最多选择 {limit} 章，请重新发送更小的章节范围。"
+        return selection, None
+
+    async def submit(self, event: Any, raw_jm_id: str) -> SubmitResult:
+        await self.start()
+        jm_id = normalize_jm_id(raw_jm_id)
+        config_error = self._submission_error(jm_id)
+        if config_error is not None:
+            return SubmitResult(config_error)
+
         session = str(getattr(event, "session", "") or "")
-        requester = Requester(event=event, session=session)
+        user_id = _event_user_id(event, session)
+        requester = Requester(event=event, session=session, user_id=user_id)
+        rate_error = self._rate_limit_error(requester, jm_id)
+        if rate_error is not None:
+            return SubmitResult(rate_error)
         async with self._lock:
             self._prune_state_locked()
             self._pending_selections.pop(session, None)
@@ -212,6 +339,9 @@ class DownloadCoordinator:
             job = self._jobs.get(job_key)
             if job is not None and job.task is not None and not job.task.done():
                 if not any(item.session == session for item in job.requesters):
+                    quota_error = self._user_quota_error_locked(user_id)
+                    if quota_error is not None:
+                        return SubmitResult(quota_error)
                     job.requesters.append(requester)
                 return SubmitResult(f"JM{jm_id} 正在处理中，完成后会自动发送，请不要重复提交。")
 
@@ -219,23 +349,27 @@ class DownloadCoordinator:
             if self._is_recently_delivered(session, job_key):
                 return SubmitResult(f"JM{jm_id} 刚刚已经发送过，已跳过短时间内的重复请求。")
 
-            admission_error = self._admission_error_locked(session)
+            admission_error = self._admission_error_locked(session, user_id)
             if admission_error is not None:
+                self._record_request_rejection(requester, jm_id, admission_error)
                 return SubmitResult(admission_error)
 
             job = Job(jm_id=jm_id, requesters=[requester])
             if self.is_valid_cache(archive_path):
                 job.task = asyncio.create_task(self._deliver_cached(job, archive_path))
                 self._jobs[job_key] = job
+                self._record_request_event(requester, jm_id, "cache")
                 return SubmitResult(f"已找到 JM{jm_id} 的缓存，正在发送压缩包。")
 
             job.task = asyncio.create_task(self._prepare_and_download(job))
             self._jobs[job_key] = job
+            self._record_request_event(requester, jm_id, "download")
             return SubmitResult(f"已收到 JM{jm_id}，正在检查章节数并准备下载。")
 
     async def select_chapters(
         self, event: Any, raw_selection: str
     ) -> ChapterSelectionResult | None:
+        await self.start()
         session = str(getattr(event, "session", "") or "")
         async with self._lock:
             pending = self._pending_selections.get(session)
@@ -253,19 +387,12 @@ class DownloadCoordinator:
                 )
             self._prune_state_locked(preserve_session=session)
 
-            selection = parse_chapter_selection(raw_selection, len(pending.chapters))
-            if selection is None:
-                return ChapterSelectionResult(
-                    "章节格式不正确，请回复类似 1-3,5 的章节编号。",
-                    accepted=False,
-                )
-
-            limit = self.settings.max_chapters_per_download
-            if limit > 0 and len(selection) > limit:
-                return ChapterSelectionResult(
-                    f"本次最多选择 {limit} 章，请重新发送更小的章节范围。",
-                    accepted=False,
-                )
+            selection, selection_error = self._validated_selection(
+                raw_selection, len(pending.chapters)
+            )
+            if selection_error is not None:
+                return ChapterSelectionResult(selection_error, accepted=False)
+            assert selection is not None
 
             job = Job(
                 jm_id=pending.jm_id,
@@ -280,6 +407,11 @@ class DownloadCoordinator:
                 and not active_job.task.done()
             ):
                 if not any(item.session == session for item in active_job.requesters):
+                    quota_error = self._user_quota_error_locked(
+                        pending.requester.user_id
+                    )
+                    if quota_error is not None:
+                        return ChapterSelectionResult(quota_error, accepted=False)
                     active_job.requesters.append(pending.requester)
                 self._pending_selections.pop(session, None)
                 return ChapterSelectionResult(
@@ -295,14 +427,22 @@ class DownloadCoordinator:
                     accepted=True,
                 )
 
-            admission_error = self._admission_error_locked(session)
+            admission_error = self._admission_error_locked(
+                session, pending.requester.user_id
+            )
             if admission_error is not None:
+                self._record_request_rejection(
+                    pending.requester, pending.jm_id, admission_error
+                )
                 return ChapterSelectionResult(admission_error, accepted=False)
 
             self._pending_selections.pop(session, None)
             if self.is_valid_cache(archive_path):
                 job.task = asyncio.create_task(self._deliver_cached(job, archive_path))
                 self._jobs[job_key] = job
+                self._record_request_event(
+                    pending.requester, job.jm_id, "selected_cache"
+                )
                 return ChapterSelectionResult(
                     f"已找到 JM{job.jm_id} 所选章节的缓存，正在发送压缩包。",
                     accepted=True,
@@ -310,6 +450,9 @@ class DownloadCoordinator:
 
             job.task = asyncio.create_task(self._download_and_deliver(job))
             self._jobs[job_key] = job
+            self._record_request_event(
+                pending.requester, job.jm_id, "selected_download"
+            )
             selected_text = format_selection(selection)
             page_limit = self.settings.max_pages_per_download
             page_notice = f"，最多下载前 {page_limit} 页" if page_limit > 0 else ""
@@ -331,13 +474,274 @@ class DownloadCoordinator:
         return f"已取消 JM{pending.jm_id} 的章节选择。"
 
     async def close(self):
+        background_tasks = list(self._background_tasks)
+        for task in background_tasks:
+            task.cancel()
         tasks = [job.task for job in self._jobs.values() if job.task is not None]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
         self._jobs.clear()
         self._pending_selections.clear()
+        self._background_tasks.clear()
+        self._started = False
+
+    async def cancel_jobs(self, target: str) -> list[str]:
+        normalized = str(target or "").strip().lower()
+        cancel_all = normalized in {"all", "全部", "*"}
+        jm_id = None if cancel_all else normalize_jm_id(normalized)
+        if not cancel_all and jm_id is None:
+            return []
+
+        async with self._lock:
+            matched = [
+                (key, job)
+                for key, job in self._jobs.items()
+                if cancel_all or job.jm_id == jm_id
+            ]
+            pending_sessions = [
+                session
+                for session, pending in self._pending_selections.items()
+                if cancel_all or pending.jm_id == jm_id
+            ]
+            for session in pending_sessions:
+                self._pending_selections.pop(session, None)
+            for _, job in matched:
+                if job.task is not None:
+                    job.task.cancel()
+
+        for _, job in matched:
+            await self._notify_error(job, f"JM{job.jm_id} 任务已被管理员取消。")
+        tasks = [job.task for _, job in matched if job.task is not None]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        cancelled = [key for key, _ in matched]
+        cancelled.extend(f"pending:{session}" for session in pending_sessions)
+        self.store.record_event(
+            "admin_cancel",
+            level="warning",
+            success=True,
+            jm_id=jm_id,
+            details={"target": normalized, "cancelled": cancelled},
+        )
+        return cancelled
+
+    async def snapshot(self) -> dict[str, Any]:
+        await self.start()
+        async with self._lock:
+            jobs = [
+                {
+                    "key": key,
+                    "jm_id": job.jm_id,
+                    "selection": format_selection(job.selection or ()),
+                    "requester_count": len(job.requesters),
+                    "user_ids": sorted(
+                        {item.user_id for item in job.requesters if item.user_id}
+                    ),
+                    "age_seconds": round(time.monotonic() - job.created_at, 1),
+                }
+                for key, job in self._jobs.items()
+                if job.task is not None and not job.task.done()
+            ]
+            pending_count = len(self._pending_selections)
+        cache = await asyncio.to_thread(self.cache_stats)
+        return {
+            "jobs": jobs,
+            "active_jobs": len(jobs),
+            "pending_selections": pending_count,
+            "cache": cache,
+            "domains": self.store.domain_health(),
+            "metrics": self.store.metrics(),
+        }
+
+    async def run_domain_health_check(self) -> list[dict[str, Any]]:
+        async with self._health_lock:
+            await asyncio.to_thread(self._run_domain_health_check_sync)
+        return self.store.domain_health()
+
+    async def run_cache_cleanup(self) -> dict[str, Any]:
+        async with self._lock:
+            protected = {
+                self.archive_path(job.jm_id, job.selection).resolve()
+                for job in self._jobs.values()
+                if job.task is not None and not job.task.done()
+            }
+        result = await asyncio.to_thread(self._cleanup_cache_sync, protected)
+        self.store.record_event(
+            "cache_cleanup",
+            success=True,
+            bytes_count=result["removed_bytes"],
+            details=result,
+        )
+        return result
+
+    async def _domain_health_loop(self):
+        while True:
+            try:
+                await self.run_domain_health_check()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._log_error("域名健康检查失败", exc)
+            await asyncio.sleep(
+                self.settings.domain_health_check_interval_minutes * 60
+            )
+
+    async def _cache_cleanup_loop(self):
+        while True:
+            try:
+                await self.run_cache_cleanup()
+                self.store.prune(self.settings.structured_log_retention_days)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._log_error("缓存清理失败", exc)
+            await asyncio.sleep(self.settings.cache_cleanup_interval_minutes * 60)
+
+    def _run_domain_health_check_sync(self):
+        jmcomic = _load_jmcomic()
+        health_root = self.settings.download_root / ".domain-health"
+        shutil.rmtree(health_root, ignore_errors=True)
+        health_root.mkdir(parents=True, exist_ok=True)
+        try:
+            domains = self.settings.client["domain"][:MAX_DOMAIN_COUNT]
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(4, len(domains))
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        self._check_domain_health_sync,
+                        jmcomic,
+                        health_root / hashlib.sha256(domain.encode()).hexdigest()[:12],
+                        domain,
+                    )
+                    for domain in domains
+                ]
+                for future in futures:
+                    domain, healthy, latency_ms, status_code, error = future.result()
+                    self.store.record_domain_health(
+                        domain, healthy, latency_ms, status_code, error
+                    )
+                    self.store.record_event(
+                        "domain_health",
+                        level="info" if healthy else "warning",
+                        success=healthy,
+                        reason=None if healthy else "域名不可用",
+                        duration_ms=latency_ms,
+                        details={"domain": domain, "status_code": status_code},
+                    )
+        finally:
+            shutil.rmtree(health_root, ignore_errors=True)
+
+    def _check_domain_health_sync(
+        self, jmcomic: Any, work_root: Path, domain: str
+    ) -> tuple[str, bool, int, int | None, str | None]:
+        started_at = time.monotonic()
+        healthy = False
+        status_code = None
+        error = None
+        try:
+            work_root.mkdir(parents=True, exist_ok=True)
+            option = jmcomic.JmOption.construct(
+                self._build_option_config(
+                    work_root,
+                    domains=[domain],
+                    use_health_order=False,
+                )
+            )
+            client = option.build_jm_client()
+            response = client.get(
+                "/", timeout=self.settings.domain_health_check_timeout_seconds
+            )
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            content = getattr(response, "content", b"")
+            healthy = 200 <= status_code < 500 and bool(content)
+            if not healthy:
+                error = f"HTTP {status_code} 或响应为空"
+        except Exception as exc:
+            error = self._sanitize_error(exc)
+        latency_ms = int((time.monotonic() - started_at) * 1000)
+        return domain, healthy, latency_ms, status_code, error
+
+    def _ordered_domains(self) -> list[str]:
+        configured = list(self.settings.client["domain"])
+        if not self.settings.domain_health_check_enabled:
+            return configured
+        records = {item["domain"]: item for item in self.store.domain_health()}
+        stale_after = self.settings.domain_health_check_interval_minutes * 120
+        now = time.time()
+
+        def rank(domain: str) -> tuple[int, int, int]:
+            item = records.get(domain)
+            original_index = configured.index(domain)
+            if item is None or now - item["checked_at"] > stale_after:
+                return 1, original_index, original_index
+            if item["healthy"]:
+                return 0, int(item["latency_ms"] or 0), original_index
+            return 2, original_index, original_index
+
+        return sorted(configured, key=rank)
+
+    def cache_stats(self) -> dict[str, Any]:
+        archives = [
+            path
+            for path in self.settings.archive_dir.glob("JM*.zip")
+            if path.is_file() and not path.name.endswith(".partial.zip")
+        ]
+        sizes = [path.stat().st_size for path in archives]
+        return {
+            "files": len(archives),
+            "bytes": sum(sizes),
+            "max_bytes": self.settings.cache_max_size_mb * 1024 * 1024,
+            "expire_days": self.settings.cache_expire_days,
+        }
+
+    def _cleanup_cache_sync(self, protected: set[Path]) -> dict[str, Any]:
+        now = time.time()
+        all_archives = [
+            path
+            for path in self.settings.archive_dir.glob("JM*.zip")
+            if path.is_file()
+            and not path.name.endswith(".partial.zip")
+        ]
+        archives = [path for path in all_archives if path.resolve() not in protected]
+        removed: list[str] = []
+        removed_bytes = 0
+
+        def remove_archive(path: Path):
+            nonlocal removed_bytes
+            size = path.stat().st_size if path.exists() else 0
+            path.unlink(missing_ok=True)
+            self.manifest_path(path).unlink(missing_ok=True)
+            removed.append(path.name)
+            removed_bytes += size
+
+        expire_days = self.settings.cache_expire_days
+        if expire_days > 0:
+            cutoff = now - expire_days * 86400
+            for path in list(archives):
+                if path.stat().st_mtime < cutoff:
+                    remove_archive(path)
+                    archives.remove(path)
+
+        max_bytes = self.settings.cache_max_size_mb * 1024 * 1024
+        total_bytes = self.cache_stats()["bytes"]
+        if max_bytes > 0 and total_bytes > max_bytes:
+            for path in sorted(archives, key=lambda item: item.stat().st_mtime):
+                if total_bytes <= max_bytes:
+                    break
+                size = path.stat().st_size
+                remove_archive(path)
+                total_bytes -= size
+        return {
+            "removed_files": removed,
+            "removed_count": len(removed),
+            "removed_bytes": removed_bytes,
+            "remaining_bytes": self.cache_stats()["bytes"],
+        }
 
     def job_key(self, jm_id: str, selection: tuple[int, ...] | None = None) -> str:
         if selection is None:
@@ -418,6 +822,14 @@ class DownloadCoordinator:
         if (
             manifest.get("max_chapters_per_download")
             != self.settings.max_chapters_per_download
+        ):
+            return False
+        compression_enabled = self.settings.pdf_compression_enabled
+        if manifest.get("pdf_compression_enabled") != compression_enabled:
+            return False
+        if compression_enabled and (
+            manifest.get("pdf_jpeg_quality") != self.settings.pdf_jpeg_quality
+            or manifest.get("pdf_max_width") != self.settings.pdf_max_width
         ):
             return False
         if manifest.get("cache_format_version") != CACHE_FORMAT_VERSION:
@@ -502,6 +914,7 @@ class DownloadCoordinator:
             raise
         except Exception as exc:
             self._log_error(f"JM{job.jm_id} 下载失败", exc)
+            self._record_job_failure(job, "章节检查失败", exc)
             await self._notify_error(
                 job,
                 f"JM{job.jm_id} 处理失败，请联系管理员查看 AstrBot 日志。",
@@ -511,16 +924,39 @@ class DownloadCoordinator:
 
     async def _download_and_deliver(self, job: Job):
         archive_path = self.archive_path(job.jm_id, job.selection)
+        started_at = time.monotonic()
         try:
             async with self._semaphore:
-                await asyncio.to_thread(
+                result = await asyncio.to_thread(
                     self.build_archive, job.jm_id, archive_path, job.selection
                 )
+            self.store.record_event(
+                "archive_created",
+                success=True,
+                jm_id=job.jm_id,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+                bytes_count=archive_path.stat().st_size,
+                details={
+                    "chapters": result.chapter_count,
+                    "pages": result.pdf_pages,
+                    "source_image_bytes": result.source_image_bytes,
+                    "pdf_bytes": result.pdf_bytes,
+                    "compressed": self.settings.pdf_compression_enabled,
+                },
+            )
             await self._send_to_requesters(job, archive_path)
         except asyncio.CancelledError:
+            self.store.record_event(
+                "job_cancelled",
+                level="warning",
+                success=False,
+                jm_id=job.jm_id,
+                reason="任务被取消",
+            )
             raise
         except Exception as exc:
             self._log_error(f"JM{job.jm_id} 下载失败", exc)
+            self._record_job_failure(job, "下载或打包失败", exc)
             await self._notify_error(
                 job,
                 f"JM{job.jm_id} 处理失败，请联系管理员查看 AstrBot 日志。",
@@ -596,11 +1032,47 @@ class DownloadCoordinator:
         await event.send(MessageChain([Nodes(nodes)]))
 
     async def _send_to_requesters(self, job: Job, archive_path: Path):
+        archive_size = await asyncio.to_thread(lambda: archive_path.stat().st_size)
+        delivered = False
         for requester in list(job.requesters):
+            quota = self.store.reserve_delivery(
+                requester.user_id,
+                archive_size,
+                self.settings.user_daily_download_limit,
+                self.settings.user_daily_traffic_mb * 1024 * 1024,
+            )
+            if not quota.allowed:
+                self.store.record_event(
+                    "delivery_rejected",
+                    level="warning",
+                    success=False,
+                    jm_id=job.jm_id,
+                    user_id=requester.user_id,
+                    session=requester.session,
+                    reason="用户每日配额",
+                    bytes_count=archive_size,
+                )
+                with suppress(Exception):
+                    await requester.event.send(
+                        requester.event.plain_result(quota.message)
+                    )
+                continue
             try:
                 await self._send_file_compat(requester.event, archive_path)
             except Exception as exc:
+                self.store.release_delivery(requester.user_id, archive_size)
                 self._log_error(f"发送 JM{job.jm_id} 文件失败", exc)
+                self.store.record_event(
+                    "delivery_failed",
+                    level="error",
+                    success=False,
+                    jm_id=job.jm_id,
+                    user_id=requester.user_id,
+                    session=requester.session,
+                    reason="平台文件发送失败",
+                    bytes_count=archive_size,
+                    details={"error": self._sanitize_error(exc)},
+                )
                 with suppress(Exception):
                     await requester.event.send(
                         requester.event.plain_result(
@@ -608,9 +1080,26 @@ class DownloadCoordinator:
                         )
                     )
                 continue
+            self.store.record_event(
+                "delivery_succeeded",
+                success=True,
+                jm_id=job.jm_id,
+                user_id=requester.user_id,
+                session=requester.session,
+                bytes_count=archive_size,
+            )
+            delivered = True
             self._last_delivery[
                 (requester.session, self.job_key(job.jm_id, job.selection))
             ] = time.monotonic()
+        if delivered:
+            await asyncio.to_thread(self._touch_cache_files, archive_path)
+
+    def _touch_cache_files(self, archive_path: Path):
+        archive_path.touch(exist_ok=True)
+        manifest = self.manifest_path(archive_path)
+        if manifest.exists():
+            manifest.touch(exist_ok=True)
 
     async def _send_file_compat(self, event: Any, archive_path: Path):
         from astrbot.api.event import MessageChain
@@ -628,6 +1117,10 @@ class DownloadCoordinator:
                 self._log_error(f"发送 JM{job.jm_id} 错误提示失败", exc)
 
     def _log_error(self, context: str, exc: Exception):
+        summary = self._sanitize_error(exc)
+        self.logger.error(f"{context}: {type(exc).__name__}: {summary}")
+
+    def _sanitize_error(self, exc: Exception) -> str:
         summary = URL_USERINFO_RE.sub(r"\1***:***@", str(exc))
         summary = SENSITIVE_ERROR_RE.sub(r"\1\2***", summary)
         sensitive_values = [self.settings.zip_password]
@@ -638,13 +1131,53 @@ class DownloadCoordinator:
             if len(secret) >= 4:
                 summary = summary.replace(secret, "***")
         summary = _truncate_text(summary, MAX_ERROR_SUMMARY_LENGTH)
-        self.logger.error(f"{context}: {type(exc).__name__}: {summary}")
+        return summary
+
+    def _record_job_failure(self, job: Job, reason: str, exc: Exception):
+        for requester in job.requesters or [Requester(None, "", "")]:
+            self.store.record_event(
+                "job_failed",
+                level="error",
+                success=False,
+                jm_id=job.jm_id,
+                user_id=requester.user_id or None,
+                session=requester.session or None,
+                reason=reason,
+                details={
+                    "exception_type": type(exc).__name__,
+                    "error": self._sanitize_error(exc),
+                },
+            )
+
+    def _record_request_event(self, requester: Requester, jm_id: str, mode: str):
+        self.store.record_event(
+            "request_accepted",
+            success=True,
+            jm_id=jm_id,
+            user_id=requester.user_id,
+            session=requester.session,
+            details={"mode": mode},
+        )
+
+    def _record_request_rejection(
+        self, requester: Requester, jm_id: str, message: str
+    ):
+        self.store.record_event(
+            "request_rejected",
+            level="warning",
+            success=False,
+            jm_id=jm_id,
+            user_id=requester.user_id,
+            session=requester.session,
+            reason="任务准入限制",
+            details={"message": message},
+        )
 
     async def _remove_job(self, jm_id: str):
         async with self._lock:
             self._jobs.pop(jm_id, None)
 
-    def _admission_error_locked(self, session: str) -> str | None:
+    def _admission_error_locked(self, session: str, user_id: str = "") -> str | None:
         active_jobs = [
             job
             for job in self._jobs.values()
@@ -663,6 +1196,33 @@ class DownloadCoordinator:
             return (
                 "当前会话已有过多任务，最多同时保留 "
                 f"{self.settings.max_active_requests_per_session} 个请求。"
+            )
+        return self._user_quota_error_locked(user_id, active_jobs)
+
+    def _user_quota_error_locked(
+        self, user_id: str, active_jobs: list[Job] | None = None
+    ) -> str | None:
+        if not user_id:
+            return None
+        usage = self.store.usage_for(user_id)
+        jobs = active_jobs if active_jobs is not None else [
+            job
+            for job in self._jobs.values()
+            if job.task is not None and not job.task.done()
+        ]
+        in_flight = sum(
+            requester.user_id == user_id
+            for job in jobs
+            for requester in job.requesters
+        )
+        daily_limit = self.settings.user_daily_download_limit
+        if daily_limit > 0 and usage["downloads"] + in_flight >= daily_limit:
+            return f"今天最多下载 {daily_limit} 次，请明天再试。"
+        byte_limit = self.settings.user_daily_traffic_mb * 1024 * 1024
+        if byte_limit > 0 and usage["bytes_sent"] >= byte_limit:
+            return (
+                f"今天的流量配额已用完（{self.settings.user_daily_traffic_mb} MB），"
+                "请明天再试。"
             )
         return None
 
@@ -728,7 +1288,7 @@ class DownloadCoordinator:
         jm_id: str,
         archive_path: Path,
         selection: tuple[int, ...] | None = None,
-    ):
+    ) -> PdfBuildResult:
         """同步执行 JM 下载、PDF 合并和 AES ZIP，供 to_thread 调用。"""
         jmcomic = _load_jmcomic()
         job_root = self.working_root(jm_id, selection)
@@ -763,6 +1323,9 @@ class DownloadCoordinator:
                         "pdf_pages": result.pdf_pages,
                         "max_chapters_per_download": result.chapter_limit,
                         "max_pages_per_download": result.page_limit,
+                        "pdf_compression_enabled": self.settings.pdf_compression_enabled,
+                        "pdf_jpeg_quality": self.settings.pdf_jpeg_quality,
+                        "pdf_max_width": self.settings.pdf_max_width,
                         "cache_format_version": CACHE_FORMAT_VERSION,
                         "archive": archive_path.name,
                     },
@@ -773,6 +1336,7 @@ class DownloadCoordinator:
             )
             work_archive.replace(archive_path)
             work_manifest.replace(self.manifest_path(archive_path))
+            return result
         finally:
             work_archive.unlink(missing_ok=True)
             work_manifest.unlink(missing_ok=True)
@@ -813,7 +1377,7 @@ class DownloadCoordinator:
             )
             downloader.raise_if_has_exception()
             pdf_path = pdf_dir / f"{jm_id}.pdf"
-            pdf_pages = self._write_pdf_from_photos(
+            pdf_pages, source_image_bytes = self._write_pdf_from_photos(
                 option,
                 downloaded_photos,
                 pdf_path,
@@ -828,6 +1392,8 @@ class DownloadCoordinator:
             pdf_pages=pdf_pages,
             chapter_limit=chapter_limit,
             page_limit=page_limit,
+            source_image_bytes=source_image_bytes,
+            pdf_bytes=pdf_path.stat().st_size,
         )
 
     def _validate_chapter_numbers(
@@ -923,7 +1489,7 @@ class DownloadCoordinator:
         photos: list[Any],
         pdf_path: Path,
         page_limit: int,
-    ) -> int:
+    ) -> tuple[int, int]:
         import img2pdf
 
         image_paths: list[Path] = []
@@ -947,14 +1513,63 @@ class DownloadCoordinator:
                 f"PDF 输入图片为 {len(image_paths)} 页，超过配置上限 {page_limit} 页。"
             )
 
+        source_image_bytes = sum(path.stat().st_size for path in image_paths)
+        if self.settings.pdf_compression_enabled:
+            image_paths = self._compress_pdf_images(
+                image_paths, pdf_path.parent / "compressed-images"
+            )
+
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
         with pdf_path.open("wb") as output:
             img2pdf.convert([str(path) for path in image_paths], outputstream=output)
         if not pdf_path.is_file() or pdf_path.stat().st_size == 0:
             raise RuntimeError("img2pdf 未能生成有效 PDF。")
-        return len(image_paths)
+        return len(image_paths), source_image_bytes
 
-    def _build_option_config(self, job_root: Path):
+    def _compress_pdf_images(
+        self, image_paths: list[Path], output_dir: Path
+    ) -> list[Path]:
+        from PIL import Image, ImageOps
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        compressed: list[Path] = []
+        for index, source in enumerate(image_paths, 1):
+            target = output_dir / f"{index:06}.jpg"
+            with Image.open(source) as opened:
+                image = ImageOps.exif_transpose(opened)
+                max_width = self.settings.pdf_max_width
+                if max_width > 0 and image.width > max_width:
+                    height = max(1, round(image.height * max_width / image.width))
+                    image = image.resize(
+                        (max_width, height), Image.Resampling.LANCZOS
+                    )
+                if image.mode in {"RGBA", "LA"} or (
+                    image.mode == "P" and "transparency" in image.info
+                ):
+                    rgba = image.convert("RGBA")
+                    background = Image.new("RGB", rgba.size, "white")
+                    background.paste(rgba, mask=rgba.getchannel("A"))
+                    image = background
+                elif image.mode != "RGB":
+                    image = image.convert("RGB")
+                image.save(
+                    target,
+                    format="JPEG",
+                    quality=self.settings.pdf_jpeg_quality,
+                    optimize=True,
+                )
+            if not target.is_file() or target.stat().st_size == 0:
+                raise RuntimeError(f"PDF 压缩图片生成失败：{source.name}")
+            compressed.append(target)
+        return compressed
+
+    def _build_option_config(
+        self,
+        job_root: Path,
+        domains: list[str] | None = None,
+        *,
+        use_health_order: bool = True,
+    ):
         plugins = json.loads(json.dumps(self.settings.plugins))
         plugins.setdefault("valid", "log")
         after_album = plugins.get("after_album")
@@ -984,7 +1599,15 @@ class DownloadCoordinator:
             },
             "client": {
                 "cache": None,
-                "domain": self.settings.client["domain"],
+                "domain": (
+                    domains
+                    if domains is not None
+                    else (
+                        self._ordered_domains()
+                        if use_health_order
+                        else self.settings.client["domain"]
+                    )
+                ),
                 "impl": self.settings.client["impl"],
                 "retry_times": _as_int(self.settings.client.get("retry_times"), 5),
                 "postman": {
@@ -1124,32 +1747,40 @@ def _parse_domains(value: Any) -> list[str]:
         values = []
     domains: list[str] = []
     for item in values:
-        text = str(item).strip()
-        if not text:
+        domain = _normalize_domain(item)
+        if domain is None:
             continue
-        try:
-            parsed = urlsplit(text if "://" in text else f"//{text}")
-            hostname = parsed.hostname
-            port = parsed.port
-        except ValueError:
-            continue
-        if not hostname:
-            continue
-        try:
-            hostname = hostname.encode("idna").decode("ascii")
-        except UnicodeError:
-            continue
-        if (
-            not re.fullmatch(r"[a-z0-9.-]+", hostname)
-            or ".." in hostname
-            or hostname.startswith((".", "-"))
-            or hostname.endswith((".", "-"))
-        ):
-            continue
-        domain = f"{hostname}:{port}" if port is not None else hostname
         if domain not in domains:
             domains.append(domain)
+        if len(domains) >= MAX_DOMAIN_COUNT:
+            break
     return domains or list(DEFAULT_DOMAIN)
+
+
+def _normalize_domain(value: Any) -> str | None:
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = urlsplit(text if "://" in text else f"//{text}")
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    try:
+        hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    if (
+        not re.fullmatch(r"[a-z0-9.-]+", hostname)
+        or ".." in hostname
+        or hostname.startswith((".", "-"))
+        or hostname.endswith((".", "-"))
+    ):
+        return None
+    return f"{hostname}:{port}" if port is not None else hostname
 
 
 def _parse_key_value_mapping(value: Any) -> dict[str, str]:
@@ -1171,6 +1802,31 @@ def _parse_key_value_mapping(value: Any) -> dict[str, str]:
         if key.strip():
             result[key.strip()] = item_value.strip()
     return result
+
+
+def _parse_identifier_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        values = value
+    elif isinstance(value, str):
+        values = re.split(r"[,;\s]+", value)
+    else:
+        values = []
+    result: list[str] = []
+    for item in values:
+        identifier = str(item or "").strip()
+        if identifier and identifier.isdigit() and identifier not in result:
+            result.append(identifier)
+    return result
+
+
+def _event_user_id(event: Any, session: str) -> str:
+    getter = getattr(event, "get_sender_id", None)
+    if callable(getter):
+        with suppress(Exception):
+            sender_id = str(getter() or "").strip()
+            if sender_id:
+                return sender_id
+    return f"session:{session}" if session else "unknown"
 
 
 def _resolve_user_path(value: Any, fallback: Path) -> Path:

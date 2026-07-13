@@ -88,6 +88,105 @@
     },
     "default": 600
   },
+  "user_rate_limit_requests": {
+    "type": "int",
+    "description": "用户速率限制次数",
+    "hint": "单个 QQ 用户在速率窗口内最多可提交的下载命令数。设为 0 表示关闭速率限制。",
+    "slider": {"min": 0, "max": 100, "step": 1},
+    "default": 5
+  },
+  "user_rate_limit_window_seconds": {
+    "type": "int",
+    "description": "用户速率限制窗口（秒）",
+    "hint": "与用户速率限制次数配合使用，默认每 60 秒最多提交 5 次。",
+    "slider": {"min": 1, "max": 3600, "step": 10},
+    "default": 60
+  },
+  "user_daily_download_limit": {
+    "type": "int",
+    "description": "用户每日下载次数",
+    "hint": "单个 QQ 用户每天最多成功接收的压缩包数量，缓存发送也计入。设为 0 表示不限。",
+    "slider": {"min": 0, "max": 1000, "step": 1},
+    "default": 0
+  },
+  "user_daily_traffic_mb": {
+    "type": "int",
+    "description": "用户每日流量配额（MB）",
+    "hint": "按机器人实际发送的 ZIP 文件大小统计。发送失败会回滚用量，设为 0 表示不限。",
+    "slider": {"min": 0, "max": 102400, "step": 100},
+    "default": 0
+  },
+  "plugin_admin_qq_ids": {
+    "type": "list",
+    "description": "插件管理员 QQ",
+    "hint": "可使用 /本子取消 命令的额外 QQ 号列表。AstrBot 全局管理员始终拥有权限。",
+    "default": []
+  },
+  "domain_health_check_enabled": {
+    "type": "bool",
+    "description": "启用域名健康检查",
+    "hint": "定期测试配置的 JM 域名，并优先使用可用且延迟较低的域名。JMComic 原有重试仍作为兜底。",
+    "default": true
+  },
+  "domain_health_check_interval_minutes": {
+    "type": "int",
+    "description": "域名检查间隔（分钟）",
+    "slider": {"min": 5, "max": 1440, "step": 5},
+    "default": 30
+  },
+  "domain_health_check_timeout_seconds": {
+    "type": "int",
+    "description": "单域名检查超时（秒）",
+    "slider": {"min": 2, "max": 60, "step": 1},
+    "default": 10
+  },
+  "pdf_compression_enabled": {
+    "type": "bool",
+    "description": "启用 PDF 图片压缩",
+    "hint": "生成 PDF 前将图片重新编码为 JPEG，可显著减小文件，但会增加 CPU 开销并产生有损压缩。",
+    "default": false
+  },
+  "pdf_jpeg_quality": {
+    "type": "int",
+    "description": "PDF JPEG 质量",
+    "hint": "仅在启用 PDF 图片压缩时生效。数值越高画质和体积越大，推荐 70 至 85。",
+    "slider": {"min": 20, "max": 95, "step": 1},
+    "default": 75
+  },
+  "pdf_max_width": {
+    "type": "int",
+    "description": "PDF 图片最大宽度",
+    "hint": "仅在启用压缩时生效。超过该宽度会等比例缩小，设为 0 表示不缩放。",
+    "slider": {"min": 0, "max": 4000, "step": 100},
+    "default": 1600
+  },
+  "cache_max_size_mb": {
+    "type": "int",
+    "description": "缓存空间配额（MB）",
+    "hint": "最终 ZIP 缓存超过配额时按最旧优先删除。设为 0 表示不限空间。",
+    "slider": {"min": 0, "max": 102400, "step": 100},
+    "default": 0
+  },
+  "cache_expire_days": {
+    "type": "int",
+    "description": "缓存自动过期（天）",
+    "hint": "删除超过指定天数的 ZIP 及其清单。设为 0 表示永不过期。",
+    "slider": {"min": 0, "max": 3650, "step": 1},
+    "default": 0
+  },
+  "cache_cleanup_interval_minutes": {
+    "type": "int",
+    "description": "缓存清理间隔（分钟）",
+    "slider": {"min": 5, "max": 1440, "step": 5},
+    "default": 60
+  },
+  "structured_log_retention_days": {
+    "type": "int",
+    "description": "统计日志保留天数",
+    "hint": "WebUI 中的结构化任务记录、失败原因和用量统计保留时间。",
+    "slider": {"min": 1, "max": 365, "step": 1},
+    "default": 30
+  },
   "client": {
     "type": "object",
     "description": "JM 客户端配置",
@@ -96,7 +195,7 @@
       "domain": {
         "type": "list",
         "description": "JM 域名列表",
-        "hint": "按顺序填写可用域名，不要包含 http:// 或路径。默认值来自 option_example.yml。",
+        "hint": "按顺序填写最多 20 个可用域名，不要包含 http:// 或路径。健康检查会自动调整实际使用顺序。",
         "default": [
           "jmcomic-zzz.one"
         ]

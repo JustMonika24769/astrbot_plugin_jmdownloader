@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f4f7fb" />
+    <title>JM 下载管理与监控</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+    <header class="page-header">
+      <div class="heading-group">
+        <p class="eyebrow" translate="no">JM Downloader</p>
+        <h1>下载管理与监控</h1>
+        <p id="summary-text" class="subtitle">正在读取运行状态…</p>
+      </div>
+      <button id="refresh-button" class="button primary" type="button">刷新数据</button>
+    </header>
+
+    <nav class="tabs" aria-label="管理页面">
+      <a href="#overview" data-tab="overview">运行概览</a>
+      <a href="#domains" data-tab="domains">域名与缓存</a>
+      <a href="#events" data-tab="events">日志与统计</a>
+      <a href="#configuration" data-tab="configuration">配置工具</a>
+    </nav>
+
+    <main id="main-content" tabindex="-1">
+      <section id="overview" class="tab-panel" aria-labelledby="overview-heading">
+        <div class="section-heading">
+          <div>
+            <h2 id="overview-heading">运行概览</h2>
+            <p>当前任务、今日用量和用户配额。</p>
+          </div>
+        </div>
+        <div id="metric-cards" class="metric-grid" aria-live="polite"></div>
+
+        <div class="panel">
+          <div class="panel-heading">
+            <div>
+              <h3>活动任务</h3>
+              <p>可取消指定 JM 任务，取消会同时通知请求用户。</p>
+            </div>
+            <button id="cancel-all-button" class="button danger" type="button">取消全部任务</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">JM 号</th>
+                  <th scope="col">章节</th>
+                  <th scope="col">请求数</th>
+                  <th scope="col">运行时间</th>
+                  <th scope="col">操作</th>
+                </tr>
+              </thead>
+              <tbody id="jobs-body"></tbody>
+            </table>
+          </div>
+          <p id="jobs-empty" class="empty-state" hidden>当前没有活动下载任务。</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-heading">
+            <div>
+              <h3>今日用户用量</h3>
+              <p>成功发送的缓存文件同样计入次数和流量。</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">用户 ID</th>
+                  <th scope="col">下载次数</th>
+                  <th scope="col">发送流量</th>
+                </tr>
+              </thead>
+              <tbody id="users-body"></tbody>
+            </table>
+          </div>
+          <p id="users-empty" class="empty-state" hidden>今天还没有产生下载用量。</p>
+        </div>
+      </section>
+
+      <section id="domains" class="tab-panel" aria-labelledby="domains-heading" hidden>
+        <div class="section-heading">
+          <div>
+            <h2 id="domains-heading">域名与缓存</h2>
+            <p>检查镜像可用性，并管理最终 ZIP 缓存空间。</p>
+          </div>
+        </div>
+        <div class="action-grid">
+          <article class="panel action-card">
+            <h3>域名健康检查</h3>
+            <p>重新测试全部配置域名；健康且延迟较低的域名会被优先使用。</p>
+            <button id="check-domains-button" class="button primary" type="button">立即检查域名</button>
+          </article>
+          <article class="panel action-card">
+            <h3>缓存清理</h3>
+            <p id="cache-summary">正在读取缓存状态…</p>
+            <button id="cleanup-cache-button" class="button danger" type="button">执行缓存清理</button>
+          </article>
+        </div>
+        <div class="panel">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">域名</th>
+                  <th scope="col">状态</th>
+                  <th scope="col">延迟</th>
+                  <th scope="col">HTTP</th>
+                  <th scope="col">最后检查</th>
+                  <th scope="col">错误</th>
+                </tr>
+              </thead>
+              <tbody id="domains-body"></tbody>
+            </table>
+          </div>
+          <p id="domains-empty" class="empty-state" hidden>尚未执行域名健康检查。</p>
+        </div>
+      </section>
+
+      <section id="events" class="tab-panel" aria-labelledby="events-heading" hidden>
+        <div class="section-heading">
+          <div>
+            <h2 id="events-heading">日志与统计</h2>
+            <p>查看最近任务事件和失败原因，敏感配置不会写入结构化日志。</p>
+          </div>
+        </div>
+        <div class="panel">
+          <h3>失败原因</h3>
+          <div id="failure-reasons" class="reason-list"></div>
+          <p id="reasons-empty" class="empty-state" hidden>统计周期内没有失败记录。</p>
+        </div>
+        <div class="panel">
+          <div class="panel-heading">
+            <div>
+              <h3>最近事件</h3>
+              <p>最多显示最近 50 条结构化记录。</p>
+            </div>
+          </div>
+          <div class="table-wrap events-table">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">时间</th>
+                  <th scope="col">类型</th>
+                  <th scope="col">结果</th>
+                  <th scope="col">JM 号</th>
+                  <th scope="col">用户</th>
+                  <th scope="col">原因</th>
+                </tr>
+              </thead>
+              <tbody id="events-body"></tbody>
+            </table>
+          </div>
+          <p id="events-empty" class="empty-state" hidden>尚无结构化事件。</p>
+        </div>
+      </section>
+
+      <section id="configuration" class="tab-panel" aria-labelledby="configuration-heading" hidden>
+        <div class="section-heading">
+          <div>
+            <h2 id="configuration-heading">配置工具</h2>
+            <p>导出配置备份，或在应用导入文件前检查字段、类型和取值范围。</p>
+          </div>
+        </div>
+        <div class="action-grid">
+          <article class="panel action-card">
+            <h3>导出配置</h3>
+            <p>默认排除 ZIP 密码、Cookie 和代理。包含敏感项的文件必须妥善保管。</p>
+            <label class="check-row" for="include-secrets">
+              <input id="include-secrets" name="include_secrets" type="checkbox" />
+              <span>导出敏感配置</span>
+            </label>
+            <button id="export-config-button" class="button primary" type="button">下载配置备份</button>
+          </article>
+          <article class="panel action-card">
+            <h3>导入配置</h3>
+            <p>先选择 JSON 文件并验证。应用配置会热重载插件运行参数。</p>
+            <label for="config-file">配置文件</label>
+            <input id="config-file" name="config_file" type="file" accept="application/json,.json" autocomplete="off" />
+            <div class="button-row">
+              <button id="validate-config-button" class="button secondary" type="button">验证配置文件</button>
+              <button id="import-config-button" class="button danger" type="button" disabled>应用已验证配置</button>
+            </div>
+          </article>
+        </div>
+        <div class="panel">
+          <h3>验证结果</h3>
+          <div id="validation-result" class="validation-result" aria-live="polite">尚未选择配置文件。</div>
+        </div>
+      </section>
+    </main>
+
+    <div id="status-message" class="status-message" role="status" aria-live="polite"></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

@@ -41,6 +41,11 @@ dist/
 data/
 logs/
 *.log
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.db
+exports/
 .agents/
 .codex/
 .config-test/

@@ -29,10 +29,15 @@ Get-Content -LiteralPath $schemaPath -Raw | ConvertFrom-Json | Out-Null
 $requiredFiles = @(
     "main.py",
     "jm_service.py",
+    "runtime_store.py",
+    "config_tools.py",
     "metadata.yaml",
     "_conf_schema.json",
     "requirements.txt",
-    "README.md"
+    "README.md",
+    "pages/dashboard/index.html",
+    "pages/dashboard/app.js",
+    "pages/dashboard/style.css"
 )
 foreach ($requiredFile in $requiredFiles) {
     if (-not (Test-Path -LiteralPath (Join-Path $projectRoot $requiredFile))) {

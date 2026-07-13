@@ -7,14 +7,14 @@ _✨ 在群聊或私聊中通过 JM 号下载本子，自动合并 PDF 并发送
 <img src="https://img.shields.io/badge/AstrBot-Plugin-blue" alt="AstrBot Plugin">
 <img src="https://img.shields.io/badge/AstrBot-4.26%2B-blueviolet" alt="AstrBot 4.26+">
 <img src="https://img.shields.io/badge/Python-3.12%2B-green" alt="Python">
-<img src="https://img.shields.io/badge/Version-v1.0.0-brightgreen" alt="Version v1.0.0">
+<img src="https://img.shields.io/badge/Version-v1.1.0-brightgreen" alt="Version v1.1.0">
 <img src="https://img.shields.io/badge/Archive-AES--256%20ZIP-orange" alt="AES-256 ZIP">
 
 </div>
 
 ## 插件简介
 
-这是一个基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的 JM 漫画下载插件。用户发送 `/本子 <jm号>` 后，插件会立即回复受理消息，在后台下载漫画、合并 PDF，并发送带密码的 AES-256 ZIP 压缩包。
+这是一个基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的 JM 漫画下载插件。用户发送 `/本子 <jm号>` 后，插件会立即回复受理消息，在后台下载漫画、合并 PDF，并发送带密码的 AES-256 ZIP 压缩包。管理员可以通过 WebUI 查看任务、用量、缓存、镜像状态和失败统计。
 
 ```text
 JM 号 → 检查缓存与章节 → 下载 → 合并 PDF → 加密压缩 → 发送文件
@@ -29,6 +29,12 @@ JM 号 → 检查缓存与章节 → 下载 → 合并 PDF → 加密压缩 → 
 - 章节较多时通过合并转发展示列表并等待用户选择。
 - 支持下载缓存、重复任务合并和短时间重复发送冷却。
 - 支持任务并发、全局队列和单会话任务数量限制。
+- 支持用户请求速率、每日下载次数和每日发送流量配额。
+- 定期检查候选域名，自动优先使用可用且延迟较低的镜像。
+- 可选图片有损压缩与等比例缩放，以减小 PDF 和发送文件体积。
+- 支持缓存空间配额、自动过期和最旧优先清理。
+- 提供管理监控 WebUI、结构化日志、失败原因统计和配置导入导出。
+- AstrBot 管理员或插件配置管理员可取消指定任务或全部任务。
 - 可配置域名、Cookie、代理、缓存目录和下载参数。
 
 ## 环境要求
@@ -80,6 +86,11 @@ zip_password: "请填写至少8位的强密码"
 | `max_concurrent_downloads` | `1` | 同时执行的下载任务数。 |
 | `client.domain` | `jmcomic-zzz.one` | JM 域名，可填写多个备用域名。 |
 | `client.cookies` | 空 | 需要登录或访问权限时填写。 |
+| `user_daily_download_limit` | `0` | 单用户每日下载次数，`0` 表示不限。 |
+| `user_daily_traffic_mb` | `0` | 单用户每日发送流量，`0` 表示不限。 |
+| `pdf_compression_enabled` | `false` | 是否压缩 PDF 输入图片。 |
+| `cache_max_size_mb` | `0` | ZIP 缓存空间配额，`0` 表示不限。 |
+| `cache_expire_days` | `0` | 缓存自动过期天数，`0` 表示永不过期。 |
 
 密码、Cookie 和代理信息不会发送到聊天中。修改密码后，无法使用新密码解密的旧缓存会自动失效。
 
@@ -122,6 +133,24 @@ zip_password: "请填写至少8位的强密码"
 - 同一会话刚收到过相同文件时，冷却期内不会重复发送。
 - 部分章节缓存与整本缓存相互独立。
 
+### 管理员取消任务
+
+AstrBot 全局管理员及 `plugin_admin_qq_ids` 中配置的 QQ 号可以使用：
+
+```text
+/本子取消 123456
+/本子取消 全部
+```
+
+### 管理监控页面
+
+在 AstrBot 插件详情页打开“下载管理与监控”，可以：
+
+- 查看活动任务、今日下载次数、流量和用户用量。
+- 取消任务、立即检查域名或执行缓存清理。
+- 查看结构化事件和失败原因统计。
+- 导出脱敏或完整配置，验证并导入 JSON 配置备份。
+
 ## 常见问题
 
 ### 压缩包无法解压
@@ -138,6 +167,10 @@ zip_password: "请填写至少8位的强密码"
 - 确认 AstrBot 所在设备或容器可以访问目标站点。
 - 查看 AstrBot 日志中的错误信息。
 - 检查任务队列或当前会话是否已达到配置上限。
+
+### 启用 PDF 压缩后画质下降
+
+PDF 压缩会将图片重新编码为 JPEG。提高 `pdf_jpeg_quality`、增大 `pdf_max_width`，或关闭 `pdf_compression_enabled`；配置变化后旧缓存会自动失效并重新生成。
 
 ### 依赖安装失败
 

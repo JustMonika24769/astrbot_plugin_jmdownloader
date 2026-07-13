@@ -6,12 +6,15 @@
 astrbot_plugin_jmdownloader/
 ├─ main.py                 # AstrBot 命令和事件入口
 ├─ jm_service.py           # 下载、限制、缓存、PDF 和发送逻辑
+├─ runtime_store.py        # SQLite 用量、事件、域名状态和指标
+├─ config_tools.py         # 配置导入、导出与严格验证
 ├─ _conf_schema.json       # AstrBot 配置页面定义
 ├─ metadata.yaml           # 插件元数据
 ├─ requirements.txt        # 运行依赖
 ├─ requirements-dev.txt    # 开发依赖
 ├─ scripts/package.ps1     # 7-Zip 打包脚本
 ├─ tests/                  # 自动化测试
+├─ pages/dashboard/        # AstrBot 原生管理 Page
 └─ doc/                    # 扩展文档
 ```
 
@@ -22,7 +25,7 @@ astrbot_plugin_jmdownloader/
 ```text
 命令输入
   → 规范化 JM 号
-  → 检查密码、冷却、重复任务和队列
+  → 检查密码、用户速率、每日配额、冷却、重复任务和队列
   → 验证缓存或读取章节
   → 必要时等待章节选择
   → 按章节及页数限制下载
@@ -67,6 +70,35 @@ PDF 生成时会再次统计精确图片路径，并拒绝以下情况：
 
 生成过程先写入临时 ZIP 和清单，验证通过后再替换正式缓存，防止未完成文件被发送。
 
+## 持久化、配额与指标
+
+`runtime_store.py` 使用 Python 标准库 SQLite，并启用 WAL。每次操作使用独立连接和进程内锁，重要计费通过 `BEGIN IMMEDIATE` 保证检查与写入原子性。
+
+数据库包含：
+
+- 速率窗口请求记录。
+- 按本地日期和用户 ID 汇总的下载次数与发送字节数。
+- 结构化任务、发送、失败、取消、域名和缓存清理事件。
+- 域名健康状态、延迟、HTTP 状态与脱敏错误摘要。
+
+每日次数与流量在调用平台文件发送前预留；发送失败后回滚。WebUI 只展示结构化字段，不读取 AstrBot 原始日志。
+
+## 域名自动切换
+
+后台任务使用当前 JM 客户端实现、代理、Cookie 和浏览器指纹逐个请求候选域名。排序策略为：健康域名按延迟排列、未知或过期状态保持配置顺序、失败域名最后。排序后的列表仍交给 JMComic，因此上游重试机制继续有效。
+
+## PDF 图片压缩
+
+启用压缩时，Pillow 会执行 EXIF 方向修正、可选等比例缩放、透明背景白底合成和 JPEG 重编码。压缩图片写入任务临时目录，原始下载图片不修改。随后仍使用精确路径列表调用 `img2pdf`。
+
+压缩开关、JPEG 质量和最大宽度写入缓存清单。仅在启用压缩时，质量或宽度变化会使缓存失效。
+
+## AstrBot 管理 Page
+
+`pages/dashboard/` 使用原生 HTML、CSS 和 JavaScript，通过 `window.AstrBotPluginPage` bridge 调用插件 Web API。后端路由由 `main.py` 注册，提供概览、事件、任务取消、域名检测、缓存清理及配置工具。
+
+Page 运行在 AstrBot 受限 iframe 中，不访问父页面 DOM、Dashboard Cookie 或 LocalStorage。配置导入由后端重新按 `_conf_schema.json` 验证，前端验证结果不能作为信任边界。
+
 ## 安全边界
 
 - JM 号和章节选择有格式及长度限制。
@@ -86,9 +118,10 @@ python -m pip install -r requirements.txt -r requirements-dev.txt
 执行检查：
 
 ```powershell
-python -m ruff check main.py jm_service.py tests
+python -m ruff check main.py jm_service.py runtime_store.py config_tools.py tests
 python -m pytest
-python -m py_compile main.py jm_service.py
+python -m py_compile main.py jm_service.py runtime_store.py config_tools.py
+node --check pages/dashboard/app.js
 ```
 
 GitHub Actions 会在 Windows 和 Python 3.12 环境执行静态检查、测试、编译及真实 7-Zip 打包。
@@ -104,7 +137,7 @@ pwsh -File .\scripts\package.ps1
 默认生成带版本号的安装包，例如：
 
 ```text
-dist\astrbot_plugin_jmdownloader-v1.0.0.zip
+dist\astrbot_plugin_jmdownloader-v1.1.0.zip
 ```
 
 指定格式或输出路径：
@@ -118,7 +151,7 @@ pwsh -File .\scripts\package.ps1 -OutputPath .\dist\custom-name.zip
 
 ## 发布前检查
 
-1. 更新 `metadata.yaml`、README 和 CHANGELOG 中的版本号。
+1. 更新 `metadata.yaml`、README、Page 和 CHANGELOG 中的版本号。
 2. 确认示例配置不包含真实 Cookie、密码或代理凭据。
 3. 执行完整测试、静态检查和编译检查。
 4. 运行打包脚本并使用 7-Zip 测试压缩包完整性。
