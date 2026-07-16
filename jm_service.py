@@ -557,10 +557,41 @@ class DownloadCoordinator:
             "metrics": self.store.metrics(),
         }
 
-    async def run_domain_health_check(self) -> list[dict[str, Any]]:
+    async def run_domain_health_check(
+        self, domains: list[str] | None = None
+    ) -> list[dict[str, Any]]:
         async with self._health_lock:
-            await asyncio.to_thread(self._run_domain_health_check_sync)
+            await asyncio.to_thread(self._run_domain_health_check_sync, domains)
         return self.store.domain_health()
+
+    async def discover_domains(self) -> dict[str, Any]:
+        async with self._health_lock:
+            discovered = await asyncio.to_thread(self._discover_domains_sync)
+            domains = [item["domain"] for item in discovered["candidates"]]
+            await asyncio.to_thread(self._run_domain_health_check_sync, domains)
+        health = {item["domain"]: item for item in self.store.domain_health()}
+        for candidate in discovered["candidates"]:
+            candidate.update(health.get(candidate["domain"], {}))
+        return discovered
+
+    async def login_once(
+        self, username: str, password: str, domain: str
+    ) -> dict[str, Any]:
+        normalized_domain = _normalize_domain(domain)
+        if normalized_domain is None:
+            raise ValueError("请选择有效的登录域名。")
+        clean_username = str(username or "").strip()
+        if not clean_username or not password:
+            raise ValueError("账号和密码不能为空。")
+        if len(clean_username) > 128 or len(password) > 256:
+            raise ValueError("账号或密码长度超出限制。")
+        async with self._health_lock:
+            return await asyncio.to_thread(
+                self._login_once_sync,
+                clean_username,
+                password,
+                normalized_domain,
+            )
 
     async def run_cache_cleanup(self) -> dict[str, Any]:
         async with self._lock:
@@ -601,13 +632,15 @@ class DownloadCoordinator:
                 self._log_error("缓存清理失败", exc)
             await asyncio.sleep(self.settings.cache_cleanup_interval_minutes * 60)
 
-    def _run_domain_health_check_sync(self):
+    def _run_domain_health_check_sync(self, domains: list[str] | None = None):
         jmcomic = _load_jmcomic()
         health_root = self.settings.download_root / ".domain-health"
         shutil.rmtree(health_root, ignore_errors=True)
         health_root.mkdir(parents=True, exist_ok=True)
         try:
-            domains = self.settings.client["domain"][:MAX_DOMAIN_COUNT]
+            domains = (domains or self.settings.client["domain"])[:MAX_DOMAIN_COUNT]
+            if not domains:
+                return
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(4, len(domains))
             ) as executor:
@@ -621,9 +654,23 @@ class DownloadCoordinator:
                     for domain in domains
                 ]
                 for future in futures:
-                    domain, healthy, latency_ms, status_code, error = future.result()
+                    (
+                        domain,
+                        healthy,
+                        latency_ms,
+                        status_code,
+                        error,
+                        final_domain,
+                        redirect_count,
+                    ) = future.result()
                     self.store.record_domain_health(
-                        domain, healthy, latency_ms, status_code, error
+                        domain,
+                        healthy,
+                        latency_ms,
+                        status_code,
+                        error,
+                        final_domain,
+                        redirect_count,
                     )
                     self.store.record_event(
                         "domain_health",
@@ -631,18 +678,25 @@ class DownloadCoordinator:
                         success=healthy,
                         reason=None if healthy else "域名不可用",
                         duration_ms=latency_ms,
-                        details={"domain": domain, "status_code": status_code},
+                        details={
+                            "domain": domain,
+                            "final_domain": final_domain,
+                            "status_code": status_code,
+                            "redirect_count": redirect_count,
+                        },
                     )
         finally:
             shutil.rmtree(health_root, ignore_errors=True)
 
     def _check_domain_health_sync(
         self, jmcomic: Any, work_root: Path, domain: str
-    ) -> tuple[str, bool, int, int | None, str | None]:
+    ) -> tuple[str, bool, int, int | None, str | None, str | None, int]:
         started_at = time.monotonic()
         healthy = False
         status_code = None
         error = None
+        final_domain = None
+        redirect_count = 0
         try:
             work_root.mkdir(parents=True, exist_ok=True)
             option = jmcomic.JmOption.construct(
@@ -658,13 +712,147 @@ class DownloadCoordinator:
             )
             status_code = int(getattr(response, "status_code", 0) or 0)
             content = getattr(response, "content", b"")
+            final_domain = _domain_from_url(getattr(response, "url", None))
+            redirect_count = int(getattr(response, "redirect_count", 0) or 0)
             healthy = 200 <= status_code < 500 and bool(content)
             if not healthy:
                 error = f"HTTP {status_code} 或响应为空"
         except Exception as exc:
             error = self._sanitize_error(exc)
         latency_ms = int((time.monotonic() - started_at) * 1000)
-        return domain, healthy, latency_ms, status_code, error
+        return (
+            domain,
+            healthy,
+            latency_ms,
+            status_code,
+            error,
+            final_domain,
+            redirect_count,
+        )
+
+    def _discover_domains_sync(self) -> dict[str, Any]:
+        jmcomic = _load_jmcomic()
+        work_root = self.settings.download_root / ".domain-discovery"
+        shutil.rmtree(work_root, ignore_errors=True)
+        work_root.mkdir(parents=True, exist_ok=True)
+        sources: dict[str, set[str]] = {}
+        errors: list[dict[str, str]] = []
+
+        def add(values: Any, source: str):
+            if isinstance(values, str):
+                values = [values]
+            for value in values or []:
+                domain = _normalize_domain(value)
+                if domain is None or domain.startswith("jm365"):
+                    continue
+                sources.setdefault(domain, set()).add(source)
+
+        add(self.settings.client["domain"], "configured")
+        try:
+            jmcomic.JmModuleConfig.DOMAIN_HTML = None
+            jmcomic.JmModuleConfig.DOMAIN_HTML_LIST = None
+            option = jmcomic.JmOption.construct(
+                self._build_option_config(work_root, use_health_order=False)
+            )
+            client = option.build_jm_client(impl="html")
+            discovery_methods = (
+                ("redirect", client.get_html_domain),
+                ("publish", client.get_html_domain_all),
+                ("github", client.get_html_domain_all_via_github),
+            )
+            for source, method in discovery_methods:
+                try:
+                    add(method(), source)
+                except Exception as exc:
+                    errors.append(
+                        {"source": source, "error": self._sanitize_error(exc)}
+                    )
+        except Exception as exc:
+            errors.append(
+                {"source": "initialization", "error": self._sanitize_error(exc)}
+            )
+        finally:
+            shutil.rmtree(work_root, ignore_errors=True)
+
+        ordered = sorted(
+            sources,
+            key=lambda domain: (
+                "redirect" not in sources[domain],
+                "configured" not in sources[domain],
+                domain,
+            ),
+        )[:MAX_DOMAIN_COUNT]
+        return {
+            "candidates": [
+                {"domain": domain, "sources": sorted(sources[domain])}
+                for domain in ordered
+            ],
+            "errors": errors,
+        }
+
+    def _login_once_sync(
+        self, username: str, password: str, domain: str
+    ) -> dict[str, Any]:
+        jmcomic = _load_jmcomic()
+        work_root = self.settings.download_root / ".one-time-login"
+        shutil.rmtree(work_root, ignore_errors=True)
+        work_root.mkdir(parents=True, exist_ok=True)
+        try:
+            option = jmcomic.JmOption.construct(
+                self._build_option_config(
+                    work_root,
+                    domains=[domain],
+                    use_health_order=False,
+                    cookies_override={},
+                )
+            )
+            client = option.build_jm_client(impl="html")
+            response = client.login(username, password)
+            fresh_cookies = dict(client.get_meta_data("cookies", None) or {})
+            auth_keys = {"AVS", "remember", "remember_id", "yuo1"}
+            if not fresh_cookies or not auth_keys.intersection(fresh_cookies):
+                raise RuntimeError("登录响应没有返回有效的登录 Cookie。")
+            merged = {
+                key: value
+                for key, value in self.settings.client.get("cookies", {}).items()
+                if key not in auth_keys
+            }
+            merged.update({str(key): str(value) for key, value in fresh_cookies.items()})
+            final_domain = _domain_from_url(getattr(response, "url", None)) or domain
+            self.store.record_event(
+                "cookie_login",
+                success=True,
+                details={
+                    "domain": domain,
+                    "final_domain": final_domain,
+                    "cookie_names": sorted(fresh_cookies),
+                },
+            )
+            return {
+                "cookies": merged,
+                "cookie_names": sorted(fresh_cookies),
+                "domain": domain,
+                "final_domain": final_domain,
+            }
+        except Exception as exc:
+            summary = self._sanitize_error(exc)
+            for secret in (username, password):
+                if secret:
+                    summary = summary.replace(secret, "***")
+            self.logger.warning(
+                f"一次性 JM 登录失败：domain={domain}, "
+                f"error={type(exc).__name__}: {summary}"
+            )
+            self.store.record_event(
+                "cookie_login",
+                level="warning",
+                success=False,
+                reason="一次性登录失败",
+                details={"domain": domain, "exception_type": type(exc).__name__},
+            )
+            raise RuntimeError("登录失败，请检查账号、密码、域名和网络状态。") from exc
+        finally:
+            shutil.rmtree(work_root, ignore_errors=True)
 
     def _ordered_domains(self) -> list[str]:
         configured = list(self.settings.client["domain"])
@@ -1268,18 +1456,35 @@ class DownloadCoordinator:
         inspect_root = self.settings.download_root / f".inspect-{jm_id}"
         inspect_root.mkdir(parents=True, exist_ok=True)
         try:
-            option = jmcomic.JmOption.construct(
-                self._build_option_config(inspect_root)
-            )
-            album = option.build_jm_client().get_album_detail(jm_id)
-            return [
-                ChapterInfo(
-                    number=index,
-                    photo_id=str(getattr(photo, "id", "")),
-                    title=str(getattr(photo, "name", "") or "").strip(),
-                )
-                for index, photo in enumerate(album, 1)
-            ]
+            last_error = None
+            for index, domain in enumerate(self._ordered_domains()):
+                try:
+                    option = jmcomic.JmOption.construct(
+                        self._build_option_config(
+                            inspect_root / f"attempt-{index}", domains=[domain]
+                        )
+                    )
+                    album = option.build_jm_client().get_album_detail(jm_id)
+                    if index > 0:
+                        self._record_domain_fallback_success(jm_id, domain, "inspect")
+                    return [
+                        ChapterInfo(
+                            number=chapter_index,
+                            photo_id=str(getattr(photo, "id", "")),
+                            title=str(getattr(photo, "name", "") or "").strip(),
+                        )
+                        for chapter_index, photo in enumerate(album, 1)
+                    ]
+                except Exception as exc:
+                    if not self._is_retryable_domain_error(exc):
+                        raise
+                    last_error = exc
+                    self._record_domain_attempt_failure(
+                        jm_id, domain, "inspect", exc
+                    )
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("没有可用于章节检查的 JM 域名。")
         finally:
             shutil.rmtree(inspect_root, ignore_errors=True)
 
@@ -1350,7 +1555,45 @@ class DownloadCoordinator:
         jm_id: str,
         selection: tuple[int, ...] | None,
     ) -> PdfBuildResult:
-        option = jmcomic.JmOption.construct(self._build_option_config(job_root))
+        last_error = None
+        for index, domain in enumerate(self._ordered_domains()):
+            attempt_root = job_root / f"attempt-{index}"
+            shutil.rmtree(pdf_dir, ignore_errors=True)
+            pdf_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                result = self._download_to_pdf_on_domain(
+                    jmcomic,
+                    attempt_root,
+                    pdf_dir,
+                    jm_id,
+                    selection,
+                    domain,
+                )
+                if index > 0:
+                    self._record_domain_fallback_success(jm_id, domain, "download")
+                return result
+            except Exception as exc:
+                if not self._is_retryable_domain_error(exc):
+                    raise
+                last_error = exc
+                self._record_domain_attempt_failure(jm_id, domain, "download", exc)
+                shutil.rmtree(attempt_root, ignore_errors=True)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("没有可用于下载的 JM 域名。")
+
+    def _download_to_pdf_on_domain(
+        self,
+        jmcomic: Any,
+        attempt_root: Path,
+        pdf_dir: Path,
+        jm_id: str,
+        selection: tuple[int, ...] | None,
+        domain: str,
+    ) -> PdfBuildResult:
+        option = jmcomic.JmOption.construct(
+            self._build_option_config(attempt_root, domains=[domain])
+        )
         page_limit = self.settings.max_pages_per_download
         chapter_limit = self.settings.max_chapters_per_download
         with jmcomic.new_downloader(option) as downloader:
@@ -1395,6 +1638,62 @@ class DownloadCoordinator:
             source_image_bytes=source_image_bytes,
             pdf_bytes=pdf_path.stat().st_size,
         )
+
+    @staticmethod
+    def _is_retryable_domain_error(exc: Exception) -> bool:
+        return type(exc).__name__ in {
+            "MissingAlbumPhotoException",
+            "RequestRetryAllFailException",
+        }
+
+    def _record_domain_attempt_failure(
+        self, jm_id: str, domain: str, stage: str, exc: Exception
+    ):
+        details = self._response_diagnostic(exc)
+        details.update(
+            {
+                "candidate_domain": domain,
+                "stage": stage,
+                "exception_type": type(exc).__name__,
+            }
+        )
+        self.logger.warning(
+            f"JM{jm_id} {stage} 域名尝试失败，将切换候选域名："
+            f"candidate={domain}, final={details.get('final_domain') or '-'}, "
+            f"status={details.get('status_code') or '-'}, "
+            f"redirects={details.get('redirect_count') or 0}, "
+            f"error={type(exc).__name__}"
+        )
+        self.store.record_event(
+            "domain_album_retry",
+            level="warning",
+            success=False,
+            jm_id=jm_id,
+            reason="候选域名无法访问该本子",
+            details=details,
+        )
+
+    def _record_domain_fallback_success(self, jm_id: str, domain: str, stage: str):
+        self.store.record_event(
+            "domain_fallback_succeeded",
+            success=True,
+            jm_id=jm_id,
+            details={"domain": domain, "stage": stage},
+        )
+
+    @staticmethod
+    def _response_diagnostic(exc: Exception) -> dict[str, Any]:
+        response = getattr(exc, "resp", None)
+        if response is None:
+            context = getattr(exc, "context", {})
+            response = context.get("resp") if isinstance(context, dict) else None
+        raw_url = getattr(response, "url", None)
+        return {
+            "final_domain": _domain_from_url(raw_url),
+            "final_path": _safe_url_path(raw_url),
+            "status_code": getattr(response, "status_code", None),
+            "redirect_count": int(getattr(response, "redirect_count", 0) or 0),
+        }
 
     def _validate_chapter_numbers(
         self,
@@ -1569,6 +1868,7 @@ class DownloadCoordinator:
         domains: list[str] | None = None,
         *,
         use_health_order: bool = True,
+        cookies_override: dict[str, str] | None = None,
     ):
         plugins = json.loads(json.dumps(self.settings.plugins))
         plugins.setdefault("valid", "log")
@@ -1617,7 +1917,11 @@ class DownloadCoordinator:
                             "impersonate", "chrome110"
                         ),
                         "proxies": self.settings.client.get("proxies", {}),
-                        "cookies": self.settings.client.get("cookies", {}),
+                        "cookies": (
+                            cookies_override
+                            if cookies_override is not None
+                            else self.settings.client.get("cookies", {})
+                        ),
                     },
                     "type": "cffi",
                 },
@@ -1781,6 +2085,31 @@ def _normalize_domain(value: Any) -> str | None:
     ):
         return None
     return f"{hostname}:{port}" if port is not None else hostname
+
+
+def _domain_from_url(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = urlsplit(text)
+        if not parsed.hostname:
+            return None
+        hostname = parsed.hostname.encode("idna").decode("ascii").lower()
+        return f"{hostname}:{parsed.port}" if parsed.port is not None else hostname
+    except (UnicodeError, ValueError):
+        return None
+
+
+def _safe_url_path(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = urlsplit(text)
+        return parsed.path[:300] or "/"
+    except ValueError:
+        return None
 
 
 def _parse_key_value_mapping(value: Any) -> dict[str, str]:

@@ -81,9 +81,28 @@ class RuntimeStore:
                     latency_ms INTEGER,
                     status_code INTEGER,
                     checked_at REAL NOT NULL,
-                    error TEXT
+                    error TEXT,
+                    final_domain TEXT,
+                    redirect_count INTEGER NOT NULL DEFAULT 0
                 );
                 """
+            )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(domain_health)")
+            }
+            if "final_domain" not in columns:
+                connection.execute(
+                    "ALTER TABLE domain_health ADD COLUMN final_domain TEXT"
+                )
+            if "redirect_count" not in columns:
+                connection.execute(
+                    "ALTER TABLE domain_health ADD COLUMN "
+                    "redirect_count INTEGER NOT NULL DEFAULT 0"
+                )
+            connection.execute(
+                "UPDATE domain_health SET redirect_count = 0 "
+                "WHERE redirect_count IS NULL"
             )
 
     @staticmethod
@@ -325,19 +344,24 @@ class RuntimeStore:
         latency_ms: int | None,
         status_code: int | None,
         error: str | None,
+        final_domain: str | None = None,
+        redirect_count: int | None = None,
     ):
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO domain_health(
-                    domain, healthy, latency_ms, status_code, checked_at, error
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    domain, healthy, latency_ms, status_code, checked_at, error,
+                    final_domain, redirect_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(domain) DO UPDATE SET
                     healthy = excluded.healthy,
                     latency_ms = excluded.latency_ms,
                     status_code = excluded.status_code,
                     checked_at = excluded.checked_at,
-                    error = excluded.error
+                    error = excluded.error,
+                    final_domain = excluded.final_domain,
+                    redirect_count = excluded.redirect_count
                 """,
                 (
                     domain,
@@ -346,6 +370,8 @@ class RuntimeStore:
                     status_code,
                     time.time(),
                     _safe_text(error),
+                    _safe_text(final_domain, 253),
+                    max(0, int(redirect_count or 0)),
                 ),
             )
 
@@ -362,6 +388,8 @@ class RuntimeStore:
                 "status_code": row["status_code"],
                 "checked_at": row["checked_at"],
                 "error": row["error"],
+                "final_domain": row["final_domain"],
+                "redirect_count": row["redirect_count"],
             }
             for row in rows
         ]

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -12,8 +13,15 @@ from runtime_store import RuntimeStore
 
 
 class Logger:
+    def __init__(self):
+        self.warnings = []
+        self.errors = []
+
     def error(self, _message):
-        pass
+        self.errors.append(_message)
+
+    def warning(self, message):
+        self.warnings.append(message)
 
 
 class Event:
@@ -70,7 +78,9 @@ def test_structured_metrics_and_domain_ordering(tmp_path):
         client={"domain": ["slow.example", "fast.example", "bad.example"]},
     )
     store = RuntimeStore(tmp_path / "runtime.sqlite3")
-    store.record_domain_health("slow.example", True, 300, 200, None)
+    store.record_domain_health(
+        "slow.example", True, 300, 200, None, "current.example", 1
+    )
     store.record_domain_health("fast.example", True, 20, 200, None)
     store.record_domain_health("bad.example", False, 10, 503, "unavailable")
     coordinator = jm_service.DownloadCoordinator(settings, Logger(), store)
@@ -80,6 +90,11 @@ def test_structured_metrics_and_domain_ordering(tmp_path):
         "slow.example",
         "bad.example",
     ]
+    slow_health = next(
+        item for item in store.domain_health() if item["domain"] == "slow.example"
+    )
+    assert slow_health["final_domain"] == "current.example"
+    assert slow_health["redirect_count"] == 1
 
     store.record_event("delivery_succeeded", success=True, bytes_count=100)
     store.record_event("job_failed", success=False, reason="下载失败")
@@ -87,6 +102,40 @@ def test_structured_metrics_and_domain_ordering(tmp_path):
     metrics = store.metrics()
     assert metrics["outcomes"] == {"success": 1, "failure": 1}
     assert metrics["failure_reasons"][0] == {"reason": "下载失败", "count": 1}
+
+
+def test_domain_health_schema_migrates_from_v1_1(tmp_path):
+    database = tmp_path / "runtime.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE domain_health (
+                domain TEXT PRIMARY KEY,
+                healthy INTEGER NOT NULL,
+                latency_ms INTEGER,
+                status_code INTEGER,
+                checked_at REAL NOT NULL,
+                error TEXT
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO domain_health VALUES (?, ?, ?, ?, ?, ?)",
+            ("old.example", 1, 25, 200, time.time(), None),
+        )
+
+    store = RuntimeStore(database)
+    old = store.domain_health()[0]
+    assert old["domain"] == "old.example"
+    assert old["final_domain"] is None
+    assert old["redirect_count"] == 0
+
+    store.record_domain_health(
+        "old.example", True, 20, 200, None, "new.example", 2
+    )
+    migrated = store.domain_health()[0]
+    assert migrated["final_domain"] == "new.example"
+    assert migrated["redirect_count"] == 2
 
 
 def test_pdf_image_compression(tmp_path):
@@ -233,3 +282,210 @@ def test_config_export_validation_and_secret_preservation(tmp_path):
     assert not invalid.valid
     assert any("zip_password" in error for error in invalid.errors)
     assert any("client.domain" in error for error in invalid.errors)
+
+
+def test_album_inspection_retries_semantic_missing_on_next_domain(
+    tmp_path, monkeypatch
+):
+    class Response:
+        url = "https://real-bad.example/error/album_missing"
+        status_code = 200
+        redirect_count = 1
+
+    class MissingAlbumPhotoException(Exception):
+        def __init__(self):
+            super().__init__("hardcoded https://18comic.vip/album/123/")
+            self.resp = Response()
+
+    class Photo:
+        id = "1"
+        name = "chapter"
+
+    attempts = []
+
+    class Client:
+        def __init__(self, domain):
+            self.domain = domain
+
+        def get_album_detail(self, _jm_id):
+            attempts.append(self.domain)
+            if self.domain == "bad.example":
+                raise MissingAlbumPhotoException()
+            return [Photo()]
+
+    class Option:
+        def __init__(self, config):
+            self.domain = config["client"]["domain"][0]
+
+        def build_jm_client(self, **_kwargs):
+            return Client(self.domain)
+
+    fake_jmcomic = type(
+        "FakeJmcomic",
+        (),
+        {"JmOption": type("Factory", (), {"construct": staticmethod(Option)})},
+    )
+    monkeypatch.setattr(jm_service, "_load_jmcomic", lambda: fake_jmcomic)
+    settings = make_settings(
+        tmp_path,
+        client={"domain": ["bad.example", "good.example"]},
+    )
+    logger = Logger()
+    coordinator = jm_service.DownloadCoordinator(settings, logger)
+
+    chapters = coordinator.inspect_album("123")
+    assert attempts == ["bad.example", "good.example"]
+    assert chapters[0].title == "chapter"
+    assert "final=real-bad.example" in logger.warnings[0]
+    retry_event = next(
+        event
+        for event in coordinator.store.list_events()
+        if event["event_type"] == "domain_album_retry"
+    )
+    assert retry_event["details"]["final_domain"] == "real-bad.example"
+    assert retry_event["details"]["final_path"] == "/error/album_missing"
+
+
+def test_download_pipeline_retries_semantic_missing(tmp_path):
+    class MissingAlbumPhotoException(Exception):
+        pass
+
+    settings = make_settings(
+        tmp_path,
+        client={"domain": ["bad.example", "good.example"]},
+    )
+    coordinator = jm_service.DownloadCoordinator(settings, Logger())
+    calls = []
+
+    def download_on_domain(
+        _jmcomic, _attempt_root, pdf_dir, _jm_id, _selection, domain
+    ):
+        calls.append(domain)
+        if domain == "bad.example":
+            raise MissingAlbumPhotoException("missing")
+        pdf_path = pdf_dir / "123.pdf"
+        pdf_path.write_bytes(b"%PDF-test")
+        return jm_service.PdfBuildResult(
+            pdf_path=pdf_path,
+            chapter_count=1,
+            pdf_pages=1,
+            chapter_limit=20,
+            page_limit=80,
+            source_image_bytes=10,
+            pdf_bytes=9,
+        )
+
+    coordinator._download_to_pdf_on_domain = download_on_domain
+    result = coordinator._download_to_pdf(
+        object(), tmp_path / "job", tmp_path / "pdf", "123", None
+    )
+    assert calls == ["bad.example", "good.example"]
+    assert result.pdf_path.read_bytes() == b"%PDF-test"
+
+
+def test_one_time_login_returns_cookies_without_retaining_password(
+    tmp_path, monkeypatch
+):
+    captured_configs = []
+
+    class Response:
+        url = "https://current.example/login"
+
+    class Client:
+        def login(self, username, password):
+            assert username == "account"
+            assert password == "temporary-password"
+            return Response()
+
+        def get_meta_data(self, key, default=None):
+            if key == "cookies":
+                return {"AVS": "new-avs", "remember": "new-remember"}
+            return default
+
+    class Option:
+        def build_jm_client(self, **_kwargs):
+            return Client()
+
+    class Factory:
+        @staticmethod
+        def construct(config):
+            captured_configs.append(config)
+            return Option()
+
+    fake_jmcomic = type("FakeJmcomic", (), {"JmOption": Factory})
+    monkeypatch.setattr(jm_service, "_load_jmcomic", lambda: fake_jmcomic)
+    settings = make_settings(
+        tmp_path,
+        client={
+            "domain": ["current.example"],
+            "cookies": '{"AVS":"old-avs","cf_clearance":"keep"}',
+        },
+    )
+    coordinator = jm_service.DownloadCoordinator(settings, Logger())
+
+    result = asyncio.run(
+        coordinator.login_once(
+            "account", "temporary-password", "current.example"
+        )
+    )
+    assert captured_configs[0]["client"]["postman"]["meta_data"]["cookies"] == {}
+    assert result["cookies"] == {
+        "cf_clearance": "keep",
+        "AVS": "new-avs",
+        "remember": "new-remember",
+    }
+    assert "password" not in result
+    assert "username" not in result
+
+
+def test_domain_discovery_combines_upstream_sources(tmp_path, monkeypatch):
+    class Client:
+        def get_html_domain(self):
+            return "redirect.example"
+
+        def get_html_domain_all(self):
+            return ["publish.example", "redirect.example", "jm365.example/app"]
+
+        def get_html_domain_all_via_github(self):
+            return {"github.example", "publish.example"}
+
+    class Option:
+        def build_jm_client(self, **_kwargs):
+            return Client()
+
+    class ModuleConfig:
+        DOMAIN_HTML = "cached.example"
+        DOMAIN_HTML_LIST = ["cached.example"]
+
+    fake_jmcomic = type(
+        "FakeJmcomic",
+        (),
+        {
+            "JmOption": type(
+                "Factory", (), {"construct": staticmethod(lambda _config: Option())}
+            ),
+            "JmModuleConfig": ModuleConfig,
+        },
+    )
+    monkeypatch.setattr(jm_service, "_load_jmcomic", lambda: fake_jmcomic)
+    settings = make_settings(
+        tmp_path,
+        client={"domain": ["configured.example"]},
+    )
+    coordinator = jm_service.DownloadCoordinator(settings, Logger())
+
+    result = coordinator._discover_domains_sync()
+    domains = [item["domain"] for item in result["candidates"]]
+    assert domains == [
+        "redirect.example",
+        "configured.example",
+        "github.example",
+        "publish.example",
+    ]
+    publish = next(
+        item for item in result["candidates"] if item["domain"] == "publish.example"
+    )
+    assert publish["sources"] == ["github", "publish"]
+    assert result["errors"] == []
+    assert ModuleConfig.DOMAIN_HTML is None
+    assert ModuleConfig.DOMAIN_HTML_LIST is None

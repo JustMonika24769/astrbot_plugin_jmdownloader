@@ -412,7 +412,10 @@ label {
   font-weight: 700;
 }
 
-input[type="file"] {
+input[type="file"],
+input[type="text"],
+input[type="password"],
+select {
   width: 100%;
   min-width: 0;
   padding: 10px;
@@ -420,6 +423,29 @@ input[type="file"] {
   border-radius: 10px;
   background: var(--surface-muted);
   color: var(--text);
+}
+
+select {
+  min-height: 44px;
+  background-color: var(--surface-muted);
+  color: var(--text);
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.login-form {
+  max-width: 900px;
+}
+
+.domain-checkbox {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--primary);
 }
 
 .check-row {

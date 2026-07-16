@@ -85,7 +85,11 @@ PDF 生成时会再次统计精确图片路径，并拒绝以下情况：
 
 ## 域名自动切换
 
-后台任务使用当前 JM 客户端实现、代理、Cookie 和浏览器指纹逐个请求候选域名。排序策略为：健康域名按延迟排列、未知或过期状态保持配置顺序、失败域名最后。排序后的列表仍交给 JMComic，因此上游重试机制继续有效。
+后台任务使用当前 JM 客户端实现、代理、Cookie 和浏览器指纹逐个请求候选域名。排序策略为：健康域名按延迟排列、未知或过期状态保持配置顺序、失败域名最后。
+
+JMComic 的 HTML 客户端可能在请求成功重定向到 `/error/album_missing` 后才抛出 `MissingAlbumPhotoException`，此时上游请求级重试不会切换域名。插件因此对章节检查和正式下载分别建立单域名客户端；遇到语义缺失或请求重试耗尽后，清理本次任务目录并尝试下一个域名。日志记录候选域名、真实响应域名、路径、状态码及重定向次数，不记录 Cookie。
+
+域名发现调用 JMComic 的永久入口、发布页和 GitHub 回退能力，与管理员当前配置合并后执行健康检查。一次性登录使用独立的空 Cookie 客户端，成功后仅合并返回的 Cookie；用户名和密码不进入配置、返回体或结构化日志。
 
 ## PDF 图片压缩
 
@@ -95,7 +99,7 @@ PDF 生成时会再次统计精确图片路径，并拒绝以下情况：
 
 ## AstrBot 管理 Page
 
-`pages/dashboard/` 使用原生 HTML、CSS 和 JavaScript，通过 `window.AstrBotPluginPage` bridge 调用插件 Web API。后端路由由 `main.py` 注册，提供概览、事件、任务取消、域名检测、缓存清理及配置工具。
+`pages/dashboard/` 使用原生 HTML、CSS 和 JavaScript，通过 `window.AstrBotPluginPage` bridge 调用插件 Web API。后端路由由 `main.py` 注册，提供概览、事件、任务取消、域名检测与发现、一次性登录、缓存清理及配置工具。
 
 Page 运行在 AstrBot 受限 iframe 中，不访问父页面 DOM、Dashboard Cookie 或 LocalStorage。配置导入由后端重新按 `_conf_schema.json` 验证，前端验证结果不能作为信任边界。
 
@@ -103,6 +107,7 @@ Page 运行在 AstrBot 受限 iframe 中，不访问父页面 DOM、Dashboard Co
 
 - JM 号和章节选择有格式及长度限制。
 - 用户可见错误和日志摘要会隐藏 Cookie、密码、令牌和代理认证信息。
+- 一次性登录限制请求体和字段长度，使用后立即丢弃账号密码，只持久化 Cookie。
 - 全局队列、单会话任务数和下载并发均可限制。
 - 相同任务会合并，过期章节选择与发送冷却记录会自动清理。
 - 高级 `plugins` 配置可能加载上游插件，只应接受管理员配置的可信内容。
@@ -137,7 +142,7 @@ pwsh -File .\scripts\package.ps1
 默认生成带版本号的安装包，例如：
 
 ```text
-dist\astrbot_plugin_jmdownloader-v1.1.0.zip
+dist\astrbot_plugin_jmdownloader-v1.2.0.zip
 ```
 
 指定格式或输出路径：

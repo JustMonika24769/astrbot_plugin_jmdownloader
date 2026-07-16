@@ -13,8 +13,9 @@ from .jm_service import DownloadCoordinator, JmSettings
 from .runtime_store import RuntimeStore
 
 PLUGIN_NAME = "astrbot_plugin_jmdownloader"
-PLUGIN_VERSION = "v1.1.0"
+PLUGIN_VERSION = "v1.2.0"
 MAX_CONFIG_IMPORT_BYTES = 256 * 1024
+MAX_LOGIN_REQUEST_BYTES = 16 * 1024
 
 
 class _DeleteFileAfterResponse:
@@ -61,6 +62,24 @@ class JmDownloaderPlugin(Star):
                 self.web_check_domains,
                 ["POST"],
                 "Check JM domains",
+            ),
+            (
+                "domains/discover",
+                self.web_discover_domains,
+                ["POST"],
+                "Discover JM domains",
+            ),
+            (
+                "domains/apply",
+                self.web_apply_domains,
+                ["POST"],
+                "Apply JM domains",
+            ),
+            (
+                "auth/login",
+                self.web_cookie_login,
+                ["POST"],
+                "Refresh JM cookies by one-time login",
             ),
             (
                 "cache/cleanup",
@@ -136,6 +155,7 @@ class JmDownloaderPlugin(Star):
             "rate_window_seconds": self.settings.user_rate_limit_window_seconds,
         }
         snapshot["version"] = PLUGIN_VERSION
+        snapshot["configured_domains"] = list(self.settings.client["domain"])
         return json_response(snapshot)
 
     async def web_events(self):
@@ -155,6 +175,93 @@ class JmDownloaderPlugin(Star):
     async def web_check_domains(self):
         domains = await self.coordinator.run_domain_health_check()
         return json_response({"domains": domains})
+
+    async def web_discover_domains(self):
+        try:
+            return json_response(await self.coordinator.discover_domains())
+        except Exception as exc:
+            self.coordinator._log_error("自动发现 JM 域名失败", exc)
+            return error_response(
+                "域名发现失败，请检查网络、代理和 AstrBot 日志。",
+                status_code=502,
+            )
+
+    async def web_apply_domains(self):
+        payload = await request.json(default={})
+        domains = payload.get("domains") if isinstance(payload, dict) else None
+        if not isinstance(domains, list) or not domains:
+            return error_response("请至少选择一个候选域名。", status_code=400)
+        validation = validate_config_document(
+            {"client": {"domain": domains}},
+            dict(self.config),
+            self.config_schema,
+        )
+        if not validation.valid:
+            return error_response(
+                "域名配置无效：" + "；".join(validation.errors), status_code=400
+            )
+        busy_response = await self._replace_runtime_config(
+            validation.config,
+            "domain_config_applied",
+            {"domains": domains},
+        )
+        if busy_response is not None:
+            return busy_response
+        return json_response({"applied": True, "domains": domains})
+
+    async def web_cookie_login(self):
+        body = await request.body()
+        if len(body) > MAX_LOGIN_REQUEST_BYTES:
+            return error_response("登录请求不能超过 16 KB。", status_code=413)
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except (UnicodeDecodeError, ValueError):
+            return error_response("登录请求不是有效的 UTF-8 JSON。", status_code=400)
+        if not isinstance(payload, dict):
+            return error_response("登录请求格式不正确。", status_code=400)
+        username = str(payload.get("username", "") or "")
+        password = str(payload.get("password", "") or "")
+        domain = str(payload.get("domain", "") or "")
+        snapshot = await self.coordinator.snapshot()
+        if snapshot["active_jobs"] > 0:
+            return error_response(
+                "存在活动任务，请完成或取消任务后再刷新 Cookie。",
+                status_code=409,
+            )
+        try:
+            login_result = await self.coordinator.login_once(
+                username, password, domain
+            )
+        except (ValueError, RuntimeError) as exc:
+            return error_response(str(exc), status_code=400)
+        finally:
+            payload["password"] = None
+            password = ""
+
+        updated = json.loads(json.dumps(dict(self.config)))
+        client = updated.setdefault("client", {})
+        client["cookies"] = json.dumps(
+            login_result["cookies"], ensure_ascii=False, separators=(",", ":")
+        )
+        busy_response = await self._replace_runtime_config(
+            updated,
+            "cookie_config_refreshed",
+            {
+                "domain": login_result["domain"],
+                "final_domain": login_result["final_domain"],
+                "cookie_names": login_result["cookie_names"],
+            },
+        )
+        if busy_response is not None:
+            return busy_response
+        return json_response(
+            {
+                "updated": True,
+                "domain": login_result["domain"],
+                "final_domain": login_result["final_domain"],
+                "cookie_names": login_result["cookie_names"],
+            }
+        )
 
     async def web_cleanup_cache(self):
         return json_response(await self.coordinator.run_cache_cleanup())
@@ -209,24 +316,38 @@ class JmDownloaderPlugin(Star):
             return error_response(
                 "配置验证失败：" + "；".join(result.errors), status_code=400
             )
+        busy_response = await self._replace_runtime_config(
+            result.config,
+            "config_import",
+            {"warnings": list(result.warnings), "username": request.username},
+        )
+        if busy_response is not None:
+            return busy_response
+        return json_response(
+            {"imported": True, "warnings": list(result.warnings)}
+        )
+
+    async def _replace_runtime_config(
+        self,
+        updated_config: dict,
+        event_type: str,
+        details: dict,
+    ):
         snapshot = await self.coordinator.snapshot()
         if snapshot["active_jobs"] > 0:
-            return error_response("存在活动任务，请完成或取消任务后再导入配置。", status_code=409)
+            return error_response(
+                "存在活动任务，请完成或取消任务后再修改运行配置。",
+                status_code=409,
+            )
         await self.coordinator.close()
         self.config.clear()
-        self.config.update(result.config)
+        self.config.update(updated_config)
         self.config.save_config()
         self.settings = JmSettings.from_config(self.config, self.plugin_data_dir)
         self.coordinator = DownloadCoordinator(self.settings, logger, self.store)
         await self.coordinator.start()
-        self.store.record_event(
-            "config_import",
-            success=True,
-            details={"warnings": list(result.warnings), "username": request.username},
-        )
-        return json_response(
-            {"imported": True, "warnings": list(result.warnings)}
-        )
+        self.store.record_event(event_type, success=True, details=details)
+        return None
 
     @staticmethod
     def _prune_config_exports(export_dir: Path):

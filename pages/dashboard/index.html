@@ -92,6 +92,11 @@
         </div>
         <div class="action-grid">
           <article class="panel action-card">
+            <h3>自动发现域名</h3>
+            <p>从永久入口、官方发布页和官方 GitHub 备用页获取候选域名并检查可用性。</p>
+            <button id="discover-domains-button" class="button primary" type="button">获取候选域名</button>
+          </article>
+          <article class="panel action-card">
             <h3>域名健康检查</h3>
             <p>重新测试全部配置域名；健康且延迟较低的域名会被优先使用。</p>
             <button id="check-domains-button" class="button primary" type="button">立即检查域名</button>
@@ -103,13 +108,41 @@
           </article>
         </div>
         <div class="panel">
+          <div class="panel-heading">
+            <div>
+              <h3>发现的候选域名</h3>
+              <p>勾选后写入插件配置。应用前请确认当前没有活动任务。</p>
+            </div>
+            <button id="apply-domains-button" class="button danger" type="button" disabled>应用所选域名</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">选择</th>
+                  <th scope="col">候选域名</th>
+                  <th scope="col">来源</th>
+                  <th scope="col">最终域名</th>
+                  <th scope="col">状态</th>
+                  <th scope="col">延迟</th>
+                </tr>
+              </thead>
+              <tbody id="discovered-domains-body"></tbody>
+            </table>
+          </div>
+          <p id="discovered-domains-empty" class="empty-state">点击“获取候选域名”开始发现。</p>
+          <div id="domain-discovery-errors" class="validation-result" aria-live="polite"></div>
+        </div>
+        <div class="panel">
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
                   <th scope="col">域名</th>
+                  <th scope="col">最终域名</th>
                   <th scope="col">状态</th>
                   <th scope="col">延迟</th>
+                  <th scope="col">重定向</th>
                   <th scope="col">HTTP</th>
                   <th scope="col">最后检查</th>
                   <th scope="col">错误</th>
@@ -119,6 +152,32 @@
             </table>
           </div>
           <p id="domains-empty" class="empty-state" hidden>尚未执行域名健康检查。</p>
+        </div>
+        <div class="panel">
+          <div class="panel-heading">
+            <div>
+              <h3>登录并刷新 Cookie</h3>
+              <p>账号和密码仅用于本次登录请求，不会保存；成功后只保存服务器返回的新 Cookie。</p>
+            </div>
+          </div>
+          <form id="cookie-login-form" class="login-form">
+            <div class="form-grid">
+              <div>
+                <label for="login-domain">登录域名</label>
+                <select id="login-domain" name="domain" autocomplete="off" required></select>
+              </div>
+              <div>
+                <label for="login-username">JM 账号</label>
+                <input id="login-username" name="username" type="text" autocomplete="username" maxlength="128" required />
+              </div>
+              <div>
+                <label for="login-password">JM 密码</label>
+                <input id="login-password" name="password" type="password" autocomplete="current-password" maxlength="256" required />
+              </div>
+            </div>
+            <button id="cookie-login-button" class="button primary" type="submit">登录并更新 Cookie</button>
+          </form>
+          <div id="cookie-login-result" class="validation-result" aria-live="polite"></div>
         </div>
       </section>
 

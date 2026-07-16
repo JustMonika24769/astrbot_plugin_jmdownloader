@@ -7,7 +7,7 @@ _✨ 在群聊或私聊中通过 JM 号下载本子，自动合并 PDF 并发送
 <img src="https://img.shields.io/badge/AstrBot-Plugin-blue" alt="AstrBot Plugin">
 <img src="https://img.shields.io/badge/AstrBot-4.26%2B-blueviolet" alt="AstrBot 4.26+">
 <img src="https://img.shields.io/badge/Python-3.12%2B-green" alt="Python">
-<img src="https://img.shields.io/badge/Version-v1.1.0-brightgreen" alt="Version v1.1.0">
+<img src="https://img.shields.io/badge/Version-v1.2.0-brightgreen" alt="Version v1.2.0">
 <img src="https://img.shields.io/badge/Archive-AES--256%20ZIP-orange" alt="AES-256 ZIP">
 
 </div>
@@ -30,7 +30,8 @@ JM 号 → 检查缓存与章节 → 下载 → 合并 PDF → 加密压缩 → 
 - 支持下载缓存、重复任务合并和短时间重复发送冷却。
 - 支持任务并发、全局队列和单会话任务数量限制。
 - 支持用户请求速率、每日下载次数和每日发送流量配额。
-- 定期检查候选域名，自动优先使用可用且延迟较低的镜像。
+- 支持自动发现可用域名、检查真实重定向，并在章节检查或下载失败时切换候选镜像。
+- 可在 WebUI 一次性登录并刷新 Cookie，账号和密码不会写入插件配置。
 - 可选图片有损压缩与等比例缩放，以减小 PDF 和发送文件体积。
 - 支持缓存空间配额、自动过期和最旧优先清理。
 - 提供管理监控 WebUI、结构化日志、失败原因统计和配置导入导出。
@@ -147,7 +148,8 @@ AstrBot 全局管理员及 `plugin_admin_qq_ids` 中配置的 QQ 号可以使用
 在 AstrBot 插件详情页打开“下载管理与监控”，可以：
 
 - 查看活动任务、今日下载次数、流量和用户用量。
-- 取消任务、立即检查域名或执行缓存清理。
+- 取消任务、发现并选择 JM 域名、立即检查域名或执行缓存清理。
+- 使用 JM 账号一次性登录，将新 Cookie 保存到插件配置。
 - 查看结构化事件和失败原因统计。
 - 导出脱敏或完整配置，验证并导入 JSON 配置备份。
 
@@ -164,9 +166,14 @@ AstrBot 全局管理员及 `plugin_admin_qq_ids` 中配置的 QQ 号可以使用
 ### 下载失败或没有生成 PDF
 
 - 检查 JM 号、域名、Cookie 和代理配置。
+- 如果配置域名被重定向到新站点，请在管理页面重新发现域名并使用一次性登录刷新 Cookie。
 - 确认 AstrBot 所在设备或容器可以访问目标站点。
 - 查看 AstrBot 日志中的错误信息。
 - 检查任务队列或当前会话是否已达到配置上限。
+
+### 浏览器能访问，但插件提示本子不存在
+
+站点域名可能已重定向，而旧 Cookie 对新站点的登录状态无效。打开“下载管理与监控”的域名页面，先执行自动发现并勾选可用候选域名，再选择目标域名进行一次性登录。插件只保存登录后获得的 Cookie，不保存账号和密码。
 
 ### 启用 PDF 压缩后画质下降
 

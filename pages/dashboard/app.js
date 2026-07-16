@@ -7,6 +7,7 @@ const dateFormatter = new Intl.DateTimeFormat(navigator.language, {
 
 let overview = null;
 let stagedConfig = null;
+let discoveredDomains = [];
 let statusTimer = null;
 
 const elements = {
@@ -18,6 +19,12 @@ const elements = {
   usersEmpty: document.getElementById("users-empty"),
   domainsBody: document.getElementById("domains-body"),
   domainsEmpty: document.getElementById("domains-empty"),
+  discoveredBody: document.getElementById("discovered-domains-body"),
+  discoveredEmpty: document.getElementById("discovered-domains-empty"),
+  discoveryErrors: document.getElementById("domain-discovery-errors"),
+  applyDomainsButton: document.getElementById("apply-domains-button"),
+  loginDomain: document.getElementById("login-domain"),
+  loginResult: document.getElementById("cookie-login-result"),
   cacheSummary: document.getElementById("cache-summary"),
   eventsBody: document.getElementById("events-body"),
   eventsEmpty: document.getElementById("events-empty"),
@@ -159,14 +166,72 @@ function renderDomains(domains) {
     statusCell.append(statusPill(domain.healthy ? "可用" : "不可用", domain.healthy ? "success" : "failure"));
     row.append(
       cell(domain.domain),
+      cell(domain.final_domain || domain.domain),
       statusCell,
       cell(domain.latency_ms == null ? "—" : `${numberFormatter.format(domain.latency_ms)}\u00a0ms`),
+      cell(numberFormatter.format(domain.redirect_count || 0)),
       cell(domain.status_code),
       cell(formatDate(domain.checked_at)),
       cell(domain.error),
     );
     elements.domainsBody.append(row);
   }
+}
+
+function renderDiscoveredDomains(candidates, configuredDomains) {
+  discoveredDomains = candidates;
+  clearElement(elements.discoveredBody);
+  elements.discoveredEmpty.hidden = candidates.length > 0;
+  elements.applyDomainsButton.disabled = candidates.length === 0;
+  for (const candidate of candidates) {
+    const row = document.createElement("tr");
+    const choice = document.createElement("td");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.className = "domain-checkbox";
+    checkbox.dataset.domain = candidate.domain;
+    checkbox.name = "selected_domain";
+    checkbox.setAttribute("aria-label", `选择域名 ${candidate.domain}`);
+    checkbox.checked = configuredDomains.includes(candidate.domain);
+    checkbox.addEventListener("change", updateApplyDomainsButton);
+    choice.append(checkbox);
+    const statusCell = document.createElement("td");
+    statusCell.append(
+      statusPill(
+        candidate.healthy ? "可用" : "不可用",
+        candidate.healthy ? "success" : "failure",
+      ),
+    );
+    row.append(
+      choice,
+      cell(candidate.domain),
+      cell((candidate.sources || []).join("、")),
+      cell(candidate.final_domain || candidate.domain),
+      statusCell,
+      cell(candidate.latency_ms == null ? "—" : `${numberFormatter.format(candidate.latency_ms)}\u00a0ms`),
+    );
+    elements.discoveredBody.append(row);
+  }
+  updateApplyDomainsButton();
+  populateLoginDomains(configuredDomains, candidates.map((item) => item.domain));
+}
+
+function updateApplyDomainsButton() {
+  const selected = document.querySelectorAll('input[name="selected_domain"]:checked');
+  elements.applyDomainsButton.disabled = selected.length === 0;
+}
+
+function populateLoginDomains(configuredDomains, extraDomains = []) {
+  const current = elements.loginDomain.value;
+  const domains = [...new Set([...configuredDomains, ...extraDomains])];
+  clearElement(elements.loginDomain);
+  for (const domain of domains) {
+    const option = document.createElement("option");
+    option.value = domain;
+    option.textContent = domain;
+    elements.loginDomain.append(option);
+  }
+  if (domains.includes(current)) elements.loginDomain.value = current;
 }
 
 function renderReasons(reasons) {
@@ -225,6 +290,10 @@ function renderOverview(data) {
   renderUsers(data.metrics.top_users || []);
   renderDomains(data.domains || []);
   renderReasons(data.metrics.failure_reasons || []);
+  populateLoginDomains(
+    data.configured_domains || [],
+    discoveredDomains.map((item) => item.domain),
+  );
   const quota = data.cache.max_bytes > 0 ? ` / ${formatBytes(data.cache.max_bytes)}` : "（不限空间）";
   const expiry = data.cache.expire_days > 0 ? `${data.cache.expire_days} 天后过期` : "永不过期";
   elements.cacheSummary.textContent = `${data.cache.files} 个文件，占用 ${formatBytes(data.cache.bytes)}${quota}；${expiry}。`;
@@ -270,6 +339,92 @@ async function checkDomains() {
   } catch (error) {
     showStatus(`域名检查失败：${error.message}`);
   } finally {
+    setBusy(button, false, "");
+  }
+}
+
+async function discoverDomainCandidates() {
+  const button = document.getElementById("discover-domains-button");
+  setBusy(button, true, "正在发现并检查…");
+  elements.discoveryErrors.textContent = "";
+  try {
+    const result = await bridge.apiPost("domains/discover", {});
+    renderDiscoveredDomains(
+      result.candidates || [],
+      overview?.configured_domains || [],
+    );
+    const errors = result.errors || [];
+    if (errors.length > 0) {
+      elements.discoveryErrors.className = "validation-result failure";
+      elements.discoveryErrors.textContent = errors
+        .map((item) => `${item.source}：${item.error}`)
+        .join("\n");
+    } else {
+      elements.discoveryErrors.className = "validation-result success";
+      elements.discoveryErrors.textContent = "候选域名获取和健康检查均已完成。";
+    }
+    showStatus(`发现 ${result.candidates?.length || 0} 个候选域名。`);
+  } catch (error) {
+    elements.discoveryErrors.className = "validation-result failure";
+    elements.discoveryErrors.textContent = `发现失败：${error.message}`;
+    showStatus("域名发现失败，请检查网络和代理设置。");
+  } finally {
+    setBusy(button, false, "");
+  }
+}
+
+async function applySelectedDomains() {
+  const domains = [
+    ...document.querySelectorAll('input[name="selected_domain"]:checked'),
+  ].map((input) => input.dataset.domain);
+  if (domains.length === 0) {
+    showStatus("请至少选择一个候选域名。");
+    return;
+  }
+  if (!window.confirm(`确定应用所选的 ${domains.length} 个域名并热重载插件配置吗？`)) return;
+  const button = elements.applyDomainsButton;
+  setBusy(button, true, "正在应用…");
+  try {
+    await bridge.apiPost("domains/apply", { domains });
+    showStatus("候选域名已写入插件配置并生效。");
+    await refreshData();
+  } catch (error) {
+    showStatus(`应用域名失败：${error.message}`);
+  } finally {
+    setBusy(button, false, "");
+    updateApplyDomainsButton();
+  }
+}
+
+async function loginAndRefreshCookie(event) {
+  event.preventDefault();
+  const button = document.getElementById("cookie-login-button");
+  const usernameInput = document.getElementById("login-username");
+  const passwordInput = document.getElementById("login-password");
+  const payload = {
+    domain: elements.loginDomain.value,
+    username: usernameInput.value,
+    password: passwordInput.value,
+  };
+  if (!payload.domain || !payload.username || !payload.password) {
+    elements.loginResult.className = "validation-result failure";
+    elements.loginResult.textContent = "请选择域名并填写账号和密码。";
+    return;
+  }
+  setBusy(button, true, "正在登录…");
+  try {
+    const result = await bridge.apiPost("auth/login", payload);
+    elements.loginResult.className = "validation-result success";
+    elements.loginResult.textContent = `Cookie 已更新：${(result.cookie_names || []).join("、")}。账号和密码未保存。`;
+    usernameInput.value = "";
+    showStatus("JM 登录成功，新 Cookie 已写入插件配置。");
+    await refreshData();
+  } catch (error) {
+    elements.loginResult.className = "validation-result failure";
+    elements.loginResult.textContent = `${error.message} 请确认选择的是当前有效域名。`;
+  } finally {
+    payload.password = "";
+    passwordInput.value = "";
     setBusy(button, false, "");
   }
 }
@@ -389,6 +544,9 @@ function applyTheme() {
 document.getElementById("refresh-button").addEventListener("click", () => refreshData({ announce: true }));
 document.getElementById("cancel-all-button").addEventListener("click", () => cancelJobs("全部"));
 document.getElementById("check-domains-button").addEventListener("click", checkDomains);
+document.getElementById("discover-domains-button").addEventListener("click", discoverDomainCandidates);
+elements.applyDomainsButton.addEventListener("click", applySelectedDomains);
+document.getElementById("cookie-login-form").addEventListener("submit", loginAndRefreshCookie);
 document.getElementById("cleanup-cache-button").addEventListener("click", cleanupCache);
 document.getElementById("export-config-button").addEventListener("click", exportConfiguration);
 document.getElementById("validate-config-button").addEventListener("click", validateConfiguration);
@@ -404,7 +562,11 @@ applyTheme();
 const removeContextListener = bridge.onContext(applyTheme);
 window.addEventListener("beforeunload", (event) => {
   removeContextListener();
-  if (stagedConfig) {
+  const loginDirty = Boolean(
+    document.getElementById("login-username").value ||
+      document.getElementById("login-password").value,
+  );
+  if (stagedConfig || loginDirty) {
     event.preventDefault();
     event.returnValue = "";
   }
