@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Validate release version
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') {
+              throw "发布标签必须使用 v主版本.次版本.修订号 格式，例如 v1.2.0。"
+          }
+
+          $versionLine = Get-Content -LiteralPath .\metadata.yaml |
+              Where-Object { $_ -match '^version:\s*(.+?)\s*$' } |
+              Select-Object -First 1
+          if (-not $versionLine -or $versionLine -notmatch '^version:\s*(.+?)\s*$') {
+              throw "metadata.yaml 缺少有效的 version 字段。"
+          }
+
+          $metadataVersion = $Matches[1].Trim().Trim('"', "'")
+          if ($metadataVersion -ne $env:RELEASE_TAG) {
+              throw "标签 $env:RELEASE_TAG 与 metadata.yaml 版本 $metadataVersion 不一致。"
+          }
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint
+        run: python -m ruff check main.py jm_service.py runtime_store.py config_tools.py tests
+
+      - name: Test
+        run: python -m pytest
+
+      - name: Compile
+        run: python -m py_compile main.py jm_service.py runtime_store.py config_tools.py
+
+      - name: Check WebUI JavaScript
+        run: node --check pages/dashboard/app.js
+
+      - name: Package and checksum
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $archive = ".\dist\astrbot_plugin_jmdownloader-$env:RELEASE_TAG.zip"
+          .\scripts\package.ps1 -OutputPath $archive
+
+          & "C:\Program Files\7-Zip\7z.exe" t $archive
+          if ($LASTEXITCODE -ne 0) {
+              throw "7-Zip 完整性检查失败。"
+          }
+
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $archiveName = Split-Path -Leaf $archive
+          "$hash  $archiveName" | Set-Content -LiteralPath .\dist\SHA256SUMS.txt -Encoding utf8NoBOM
+
+      - name: Extract release notes from changelog
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $changelog = Get-Content -LiteralPath .\CHANGELOG.md -Raw -Encoding utf8
+          $escapedTag = [Regex]::Escape($env:RELEASE_TAG)
+          $pattern = "(?ms)^##\s+$escapedTag(?:\s+-[^\r\n]*)?\r?\n(?<body>.*?)(?=^##\s+|\z)"
+          $match = [Regex]::Match($changelog, $pattern)
+          if (-not $match.Success) {
+              throw "CHANGELOG.md 中未找到 $env:RELEASE_TAG 对应的二级标题。"
+          }
+
+          $releaseNotes = $match.Groups['body'].Value.Trim()
+          if ([string]::IsNullOrWhiteSpace($releaseNotes)) {
+              throw "CHANGELOG.md 中 $env:RELEASE_TAG 对应的更新内容为空。"
+          }
+
+          $releaseNotes | Set-Content -LiteralPath .\dist\RELEASE_NOTES.md -Encoding utf8NoBOM
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: astrbot_plugin_jmdownloader-${{ github.ref_name }}
+          path: |
+            dist/astrbot_plugin_jmdownloader-${{ github.ref_name }}.zip
+            dist/SHA256SUMS.txt
+            dist/RELEASE_NOTES.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create $env:RELEASE_TAG `
+              ".\dist\astrbot_plugin_jmdownloader-$env:RELEASE_TAG.zip" `
+              ".\dist\SHA256SUMS.txt" `
+              --verify-tag `
+              --title "JM 漫画下载器 $env:RELEASE_TAG" `
+              --notes-file ".\dist\RELEASE_NOTES.md"

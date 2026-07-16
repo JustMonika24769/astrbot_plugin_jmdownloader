@@ -161,4 +161,7 @@ pwsh -File .\scripts\package.ps1 -OutputPath .\dist\custom-name.zip
 3. 执行完整测试、静态检查和编译检查。
 4. 运行打包脚本并使用 7-Zip 测试压缩包完整性。
 5. 确认压缩包根目录包含 `metadata.yaml`，且不包含测试、缓存和本地配置。
-6. 创建与版本号一致的 Git tag 和 GitHub Release，并上传安装包。
+6. 创建与 `metadata.yaml` 版本一致的 Git tag，例如 `git tag v1.2.0`。
+7. 使用 `git push origin v1.2.0` 推送标签；Release 工作流会重新检查项目、提取 `CHANGELOG.md` 对应版本内容、生成 SHA-256、创建 GitHub Release 并上传安装包。
+
+Release 工作流只接受 `v主版本.次版本.修订号` 格式的稳定版本标签。`CHANGELOG.md` 必须存在对应的 `## v版本号 - 日期` 二级标题且正文不能为空。标签与 `metadata.yaml` 不一致、更新日志缺失、任意测试失败、压缩包完整性检查失败或 GitHub Release 上传失败时，发布任务都会停止。Actions 页面同时保留 30 天的 ZIP、Release 正文和校验文件构建产物。
