@@ -13,7 +13,7 @@ from .jm_service import DownloadCoordinator, JmSettings
 from .runtime_store import RuntimeStore
 
 PLUGIN_NAME = "astrbot_plugin_jmdownloader"
-PLUGIN_VERSION = "v1.2.0"
+PLUGIN_VERSION = "v1.3.0"
 MAX_CONFIG_IMPORT_BYTES = 256 * 1024
 MAX_LOGIN_REQUEST_BYTES = 16 * 1024
 

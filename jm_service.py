@@ -104,6 +104,7 @@ class JmSettings:
     archive_dir: Path
     download_root: Path
     zip_password: str
+    group_file_path: str
     duplicate_cooldown_seconds: int
     max_concurrent_downloads: int
     max_queue_size: int
@@ -182,6 +183,9 @@ class JmSettings:
             archive_dir=archive_dir,
             download_root=download_root,
             zip_password=str(config.get("zip_password", "") or ""),
+            group_file_path="/".join(
+                _group_file_path_parts(config.get("group_file_path", ""))
+            ),
             duplicate_cooldown_seconds=max(
                 0, _as_int(config.get("duplicate_cooldown_seconds"), 30)
             ),
@@ -1290,11 +1294,78 @@ class DownloadCoordinator:
             manifest.touch(exist_ok=True)
 
     async def _send_file_compat(self, event: Any, archive_path: Path):
+        group_file_path = self.settings.group_file_path
+        if group_file_path and event.get_platform_name() == "aiocqhttp":
+            group_id = str(event.get_group_id() or "").strip()
+            if group_id:
+                await self._upload_group_file_to_path(
+                    event, group_id, archive_path, group_file_path
+                )
+                return
+
         from astrbot.api.event import MessageChain
         from astrbot.api.message_components import File
 
         await event.send(
             MessageChain([File(name=archive_path.name, file=str(archive_path))])
+        )
+
+    async def _upload_group_file_to_path(
+        self,
+        event: Any,
+        group_id: str,
+        archive_path: Path,
+        group_file_path: str,
+    ):
+        bot = getattr(event, "bot", None)
+        call_action = getattr(bot, "call_action", None)
+        if not callable(call_action):
+            raise RuntimeError("当前 aiocqhttp 事件不支持群文件 API。")
+
+        routing_params: dict[str, Any] = {}
+        self_id = str(event.get_self_id() or "").strip()
+        if self_id:
+            routing_params["self_id"] = self_id
+
+        parts = _group_file_path_parts(group_file_path)
+        listing = await call_action(
+            "get_group_root_files",
+            group_id=group_id,
+            **routing_params,
+        )
+        folder_id = ""
+        resolved_parts: list[str] = []
+        for index, part in enumerate(parts):
+            folder = _find_group_folder(listing, part)
+            resolved_parts.append(part)
+            if folder is None:
+                resolved_path = "/".join(resolved_parts)
+                raise RuntimeError(
+                    f"群 {group_id} 中不存在群文件夹“{resolved_path}”。"
+                )
+            folder_id = str(
+                folder.get("folder_id") or folder.get("id") or ""
+            ).strip()
+            if not folder_id:
+                resolved_path = "/".join(resolved_parts)
+                raise RuntimeError(
+                    f"无法获取群 {group_id} 的群文件夹“{resolved_path}”ID。"
+                )
+            if index + 1 < len(parts):
+                listing = await call_action(
+                    "get_group_files_by_folder",
+                    group_id=group_id,
+                    folder_id=folder_id,
+                    **routing_params,
+                )
+
+        await call_action(
+            "upload_group_file",
+            group_id=group_id,
+            file=str(archive_path),
+            name=archive_path.name,
+            folder=folder_id,
+            **routing_params,
         )
 
     async def _notify_error(self, job: Job, message: str):
@@ -2146,6 +2217,32 @@ def _parse_identifier_list(value: Any) -> list[str]:
         if identifier and identifier.isdigit() and identifier not in result:
             result.append(identifier)
     return result
+
+
+def _group_file_path_parts(value: Any) -> tuple[str, ...]:
+    return tuple(
+        part.strip()
+        for part in re.split(r"[\\/]+", str(value or "").strip())
+        if part.strip()
+    )
+
+
+def _find_group_folder(listing: Any, folder_name: str) -> dict[str, Any] | None:
+    if not isinstance(listing, dict):
+        return None
+    data = listing.get("data")
+    if isinstance(data, dict) and "folders" not in listing:
+        listing = data
+    folders = listing.get("folders")
+    if not isinstance(folders, list):
+        return None
+    for folder in folders:
+        if not isinstance(folder, dict):
+            continue
+        name = str(folder.get("folder_name") or folder.get("name") or "").strip()
+        if name == folder_name:
+            return folder
+    return None
 
 
 def _event_user_id(event: Any, session: str) -> str:

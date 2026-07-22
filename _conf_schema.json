@@ -11,6 +11,12 @@
     "hint": "最终 ZIP 文件保存的位置，也就是 AstrBot 发送文件时读取的本地路径。留空使用插件数据目录下的 archives；相对路径按插件数据目录解析。",
     "default": ""
   },
+  "group_file_path": {
+    "type": "string",
+    "description": "群文件上传路径",
+    "hint": "仅用于 QQ 群聊。填写群文件中已存在的文件夹名称，例如“文档”；多级目录可填写“文档/漫画”。留空时按 AstrBot 默认方式发送到群文件根目录。目标目录不存在时会停止发送并记录错误。",
+    "default": ""
+  },
   "duplicate_cooldown_seconds": {
     "type": "int",
     "description": "重复请求冷却时间（秒）",

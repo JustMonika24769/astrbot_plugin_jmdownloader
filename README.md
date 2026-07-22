@@ -7,7 +7,7 @@ _✨ 在群聊或私聊中通过 JM 号下载本子，自动合并 PDF 并发送
 <img src="https://img.shields.io/badge/AstrBot-Plugin-blue" alt="AstrBot Plugin">
 <img src="https://img.shields.io/badge/AstrBot-4.26%2B-blueviolet" alt="AstrBot 4.26+">
 <img src="https://img.shields.io/badge/Python-3.12%2B-green" alt="Python">
-<img src="https://img.shields.io/badge/Version-v1.2.0-brightgreen" alt="Version v1.2.0">
+<img src="https://img.shields.io/badge/Version-v1.3.0-brightgreen" alt="Version v1.3.0">
 <img src="https://img.shields.io/badge/Archive-AES--256%20ZIP-orange" alt="AES-256 ZIP">
 
 </div>
@@ -25,6 +25,7 @@ JM 号 → 检查缓存与章节 → 下载 → 合并 PDF → 加密压缩 → 
 - 支持 QQ 群聊和私聊，可识别 `jm123456` 或 `123456`。
 - 收到命令后立即响应，下载任务在后台执行。
 - 自动合并为 PDF，并使用 AES-256 加密 ZIP 发送。
+- QQ 群聊可将 ZIP 上传到配置的群文件夹中。
 - 支持分别限制单次下载的章节数和图片页数。
 - 章节较多时通过合并转发展示列表并等待用户选择。
 - 支持下载缓存、重复任务合并和短时间重复发送冷却。
@@ -81,6 +82,7 @@ zip_password: "请填写至少8位的强密码"
 | --- | --- | --- |
 | `zip_password` | 空 | 必填，最终 ZIP 的 AES-256 密码。 |
 | `archive_dir` | `archives` | 最终压缩包的缓存和发送目录。 |
+| `group_file_path` | 空 | QQ 群文件上传路径，例如 `文档` 或 `文档/漫画`；留空发送到根目录。 |
 | `max_chapters_per_download` | `20` | 单次最大章节数，设为 `0` 表示不限。 |
 | `max_pages_per_download` | `80` | 单次最大图片页数，设为 `0` 表示不限。 |
 | `duplicate_cooldown_seconds` | `30` | 同一会话重复发送冷却时间。 |

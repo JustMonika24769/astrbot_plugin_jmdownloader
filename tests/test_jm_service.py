@@ -178,8 +178,10 @@ def test_input_and_config_helpers(tmp_path):
     settings = make_settings(
         tmp_path,
         client={"domain": ["https://Example.COM/path", "example.com", "bad host"]},
+        group_file_path=" 文档\\漫画/ ",
     )
     assert settings.client["domain"] == ["example.com"]
+    assert settings.group_file_path == "文档/漫画"
     assert settings.max_queue_size == 10
     assert settings.max_active_requests_per_session == 2
     assert jm_service.normalize_jm_id("JM00123") == "123"
@@ -191,6 +193,114 @@ def test_input_and_config_helpers(tmp_path):
     assert jm_service.parse_chapter_selection("9" * 10, 5) is None
     assert jm_service.format_selection((1, 2, 3, 5)) == "1-3,5"
     assert jm_service.ensure_chapter_isolated_dir_rule("Bd_Aid") == "Bd_Aid_Pid"
+
+
+def test_group_file_path_upload_uses_resolved_folder_id(tmp_path):
+    async def scenario():
+        settings = make_settings(tmp_path, group_file_path="文档/漫画")
+        coordinator = jm_service.DownloadCoordinator(settings, Logger())
+        archive = settings.archive_dir / "JM123.zip"
+        archive.write_bytes(b"archive")
+
+        class Bot:
+            def __init__(self):
+                self.calls = []
+
+            async def call_action(self, action, **params):
+                self.calls.append((action, params))
+                if action == "get_group_root_files":
+                    return {
+                        "files": [],
+                        "folders": [
+                            {"folder_name": "文档", "folder_id": "root-docs"}
+                        ],
+                    }
+                if action == "get_group_files_by_folder":
+                    return {
+                        "data": {
+                            "files": [],
+                            "folders": [
+                                {"name": "漫画", "id": "nested-comics"}
+                            ],
+                        }
+                    }
+                return None
+
+        class GroupEvent:
+            def __init__(self):
+                self.bot = Bot()
+
+            def get_platform_name(self):
+                return "aiocqhttp"
+
+            def get_group_id(self):
+                return "123456"
+
+            def get_self_id(self):
+                return "987654"
+
+        event = GroupEvent()
+        await coordinator._send_file_compat(event, archive)
+
+        assert [action for action, _params in event.bot.calls] == [
+            "get_group_root_files",
+            "get_group_files_by_folder",
+            "upload_group_file",
+        ]
+        nested_params = event.bot.calls[1][1]
+        assert nested_params["folder_id"] == "root-docs"
+        upload_params = event.bot.calls[2][1]
+        assert upload_params == {
+            "group_id": "123456",
+            "file": str(archive),
+            "name": "JM123.zip",
+            "folder": "nested-comics",
+            "self_id": "987654",
+        }
+
+    asyncio.run(scenario())
+
+
+def test_group_file_path_missing_folder_stops_upload(tmp_path):
+    async def scenario():
+        settings = make_settings(tmp_path, group_file_path="文档")
+        coordinator = jm_service.DownloadCoordinator(settings, Logger())
+        archive = settings.archive_dir / "JM123.zip"
+        archive.write_bytes(b"archive")
+
+        class Bot:
+            def __init__(self):
+                self.calls = []
+
+            async def call_action(self, action, **params):
+                self.calls.append((action, params))
+                return {"files": [], "folders": []}
+
+        class GroupEvent:
+            def __init__(self):
+                self.bot = Bot()
+
+            def get_platform_name(self):
+                return "aiocqhttp"
+
+            def get_group_id(self):
+                return "123456"
+
+            def get_self_id(self):
+                return ""
+
+        event = GroupEvent()
+        try:
+            await coordinator._send_file_compat(event, archive)
+        except RuntimeError as exc:
+            assert "不存在群文件夹“文档”" in str(exc)
+        else:
+            raise AssertionError("missing group folder did not stop the upload")
+        assert [action for action, _params in event.bot.calls] == [
+            "get_group_root_files"
+        ]
+
+    asyncio.run(scenario())
 
 
 def test_queue_limits_and_state_pruning(tmp_path):
