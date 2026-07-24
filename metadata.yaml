@@ -1,6 +1,6 @@
 name: astrbot_plugin_jmdownloader
 display_name: JM 漫画下载器
-version: v1.3.0
+version: v1.3.1
 author: JustMonika
 desc: 支持章节选择、页数限制、任务去重与缓存、自动合并 PDF 并发送 AES-256 加密压缩包、配额限流、域名发现与故障切换、一次性登录刷新 Cookie、PDF 压缩、缓存管理与 WebUI 监控的 JM 漫画下载插件
 short_desc: 在 QQ 中下载 JM 漫画，支持加密 PDF、域名切换、用户配额和管理监控。

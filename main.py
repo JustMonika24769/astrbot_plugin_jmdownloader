@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from contextlib import suppress
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
@@ -8,12 +9,16 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.web import error_response, file_response, json_response, request
 
-from .config_tools import export_config, validate_config_document
+from .config_tools import (
+    export_config,
+    persist_runtime_config,
+    validate_config_document,
+)
 from .jm_service import DownloadCoordinator, JmSettings
 from .runtime_store import RuntimeStore
 
 PLUGIN_NAME = "astrbot_plugin_jmdownloader"
-PLUGIN_VERSION = "v1.3.0"
+PLUGIN_VERSION = "v1.3.1"
 MAX_CONFIG_IMPORT_BYTES = 256 * 1024
 MAX_LOGIN_REQUEST_BYTES = 16 * 1024
 
@@ -47,6 +52,7 @@ class JmDownloaderPlugin(Star):
         self.store = RuntimeStore(self.plugin_data_dir / "runtime.sqlite3")
         self.settings = JmSettings.from_config(config, self.plugin_data_dir)
         self.coordinator = DownloadCoordinator(self.settings, logger, self.store)
+        self._runtime_config_lock = asyncio.Lock()
         self._register_web_apis()
 
     async def terminate(self):
@@ -182,7 +188,7 @@ class JmDownloaderPlugin(Star):
         except Exception as exc:
             self.coordinator._log_error("自动发现 JM 域名失败", exc)
             return error_response(
-                "域名发现失败，请检查网络、代理和 AstrBot 日志。",
+                "域名发现失败，可能是上游发现源超时或插件异常，请查看 AstrBot 日志。",
                 status_code=502,
             )
 
@@ -207,7 +213,14 @@ class JmDownloaderPlugin(Star):
         )
         if busy_response is not None:
             return busy_response
-        return json_response({"applied": True, "domains": domains})
+        configured_domains = list(self.settings.client["domain"])
+        return json_response(
+            {
+                "applied": True,
+                "domains": configured_domains,
+                "persisted": True,
+            }
+        )
 
     async def web_cookie_login(self):
         body = await request.body()
@@ -333,21 +346,78 @@ class JmDownloaderPlugin(Star):
         event_type: str,
         details: dict,
     ):
-        snapshot = await self.coordinator.snapshot()
-        if snapshot["active_jobs"] > 0:
-            return error_response(
-                "存在活动任务，请完成或取消任务后再修改运行配置。",
-                status_code=409,
+        async with self._runtime_config_lock:
+            snapshot = await self.coordinator.snapshot()
+            if snapshot["active_jobs"] > 0:
+                return error_response(
+                    "存在活动任务，请完成或取消任务后再修改运行配置。",
+                    status_code=409,
+                )
+
+            previous_config = json.loads(json.dumps(dict(self.config)))
+            previous_settings = self.settings
+            previous_coordinator = self.coordinator
+            try:
+                next_settings = JmSettings.from_config(
+                    updated_config, self.plugin_data_dir
+                )
+                await persist_runtime_config(self.config, updated_config)
+            except Exception as exc:
+                self.coordinator._log_error("保存插件运行配置失败", exc)
+                restored = await self._restore_persisted_config(previous_config)
+                message = (
+                    "插件配置保存失败，已恢复旧配置；请查看 AstrBot 日志。"
+                    if restored
+                    else "插件配置保存和回滚均失败，请立即重载插件并查看 AstrBot 日志。"
+                )
+                return error_response(
+                    message,
+                    status_code=500,
+                )
+
+            next_coordinator = DownloadCoordinator(next_settings, logger, self.store)
+            try:
+                await previous_coordinator.close()
+                await next_coordinator.start()
+            except Exception as exc:
+                next_coordinator._log_error("应用插件运行配置失败", exc)
+                with suppress(Exception):
+                    await next_coordinator.close()
+                restored = await self._restore_persisted_config(previous_config)
+                self.settings = previous_settings
+                self.coordinator = previous_coordinator
+                with suppress(Exception):
+                    await previous_coordinator.start()
+                message = (
+                    "新配置无法启动，已恢复旧配置；请查看 AstrBot 日志。"
+                    if restored
+                    else "新配置无法启动且配置文件回滚失败，请立即重载插件并查看日志。"
+                )
+                return error_response(
+                    message,
+                    status_code=500,
+                )
+
+            self.settings = next_settings
+            self.coordinator = next_coordinator
+            applied_details = dict(details)
+            applied_details["configured_domains"] = list(
+                next_settings.client["domain"]
             )
-        await self.coordinator.close()
-        self.config.clear()
-        self.config.update(updated_config)
-        self.config.save_config()
-        self.settings = JmSettings.from_config(self.config, self.plugin_data_dir)
-        self.coordinator = DownloadCoordinator(self.settings, logger, self.store)
-        await self.coordinator.start()
-        self.store.record_event(event_type, success=True, details=details)
-        return None
+            self.store.record_event(
+                event_type, success=True, details=applied_details
+            )
+            return None
+
+    async def _restore_persisted_config(self, previous_config: dict) -> bool:
+        try:
+            await persist_runtime_config(self.config, previous_config)
+            return True
+        except Exception as exc:
+            self.coordinator._log_error("恢复旧插件配置失败", exc)
+            self.config.clear()
+            self.config.update(previous_config)
+            return False
 
     @staticmethod
     def _prune_config_exports(export_dir: Path):

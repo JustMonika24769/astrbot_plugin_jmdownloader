@@ -284,6 +284,51 @@ def test_config_export_validation_and_secret_preservation(tmp_path):
     assert any("client.domain" in error for error in invalid.errors)
 
 
+def test_runtime_config_persistence_verifies_committed_file(tmp_path):
+    class Config(dict):
+        def __init__(self, config_path, initial):
+            super().__init__(initial)
+            self.config_path = str(config_path)
+
+        async def save_config_async(self):
+            document = json.dumps(dict(self), ensure_ascii=False)
+            await asyncio.to_thread(
+                Path(self.config_path).write_text,
+                document,
+                encoding="utf-8-sig",
+            )
+            return True
+
+    config_path = tmp_path / "plugin_config.json"
+    config = Config(config_path, {"client": {"domain": ["old.example"]}})
+    updated = {"client": {"domain": ["new.example"]}}
+    result = asyncio.run(config_tools.persist_runtime_config(config, updated))
+
+    assert result == updated
+    assert dict(config) == updated
+    assert json.loads(config_path.read_text(encoding="utf-8-sig")) == updated
+
+
+def test_runtime_config_persistence_rejects_superseded_save(tmp_path):
+    class Config(dict):
+        config_path = ""
+
+        async def save_config_async(self):
+            return False
+
+    config = Config({"client": {"domain": ["old.example"]}})
+    try:
+        asyncio.run(
+            config_tools.persist_runtime_config(
+                config, {"client": {"domain": ["new.example"]}}
+            )
+        )
+    except RuntimeError as exc:
+        assert "并发写入覆盖" in str(exc)
+    else:
+        raise AssertionError("superseded config save was accepted")
+
+
 def test_album_inspection_retries_semantic_missing_on_next_domain(
     tmp_path, monkeypatch
 ):
@@ -489,3 +534,29 @@ def test_domain_discovery_combines_upstream_sources(tmp_path, monkeypatch):
     assert result["errors"] == []
     assert ModuleConfig.DOMAIN_HTML is None
     assert ModuleConfig.DOMAIN_HTML_LIST is None
+
+
+def test_domain_discovery_does_not_block_on_candidate_health_checks(tmp_path):
+    async def scenario():
+        settings = make_settings(tmp_path)
+        coordinator = jm_service.DownloadCoordinator(settings, Logger())
+        coordinator._discover_domains_sync = lambda: {
+            "candidates": [
+                {"domain": "new.example", "sources": ["redirect"]}
+            ],
+            "errors": [],
+        }
+
+        def unexpected_health_check(_domains):
+            raise AssertionError("discovery should not run candidate health checks")
+
+        coordinator._run_domain_health_check_sync = unexpected_health_check
+        result = await coordinator.discover_domains()
+        assert result == {
+            "candidates": [
+                {"domain": "new.example", "sources": ["redirect"]}
+            ],
+            "errors": [],
+        }
+
+    asyncio.run(scenario())

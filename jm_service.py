@@ -98,6 +98,13 @@ class PdfBuildResult:
     pdf_bytes: int
 
 
+@dataclass(frozen=True)
+class FailureDiagnosis:
+    code: str
+    reason: str
+    user_message: str
+
+
 @dataclass
 class JmSettings:
     data_dir: Path
@@ -571,8 +578,6 @@ class DownloadCoordinator:
     async def discover_domains(self) -> dict[str, Any]:
         async with self._health_lock:
             discovered = await asyncio.to_thread(self._discover_domains_sync)
-            domains = [item["domain"] for item in discovered["candidates"]]
-            await asyncio.to_thread(self._run_domain_health_check_sync, domains)
         health = {item["domain"]: item for item in self.store.domain_health()}
         for candidate in discovered["candidates"]:
             candidate.update(health.get(candidate["domain"], {}))
@@ -1105,11 +1110,12 @@ class DownloadCoordinator:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            diagnosis = self._diagnose_failure(exc, "inspect")
             self._log_error(f"JM{job.jm_id} 下载失败", exc)
-            self._record_job_failure(job, "章节检查失败", exc)
+            self._record_job_failure(job, diagnosis, exc)
             await self._notify_error(
                 job,
-                f"JM{job.jm_id} 处理失败，请联系管理员查看 AstrBot 日志。",
+                f"JM{job.jm_id} 处理失败：{diagnosis.user_message}",
             )
         finally:
             await self._remove_job(self.job_key(job.jm_id, job.selection))
@@ -1147,11 +1153,12 @@ class DownloadCoordinator:
             )
             raise
         except Exception as exc:
+            diagnosis = self._diagnose_failure(exc, "download")
             self._log_error(f"JM{job.jm_id} 下载失败", exc)
-            self._record_job_failure(job, "下载或打包失败", exc)
+            self._record_job_failure(job, diagnosis, exc)
             await self._notify_error(
                 job,
-                f"JM{job.jm_id} 处理失败，请联系管理员查看 AstrBot 日志。",
+                f"JM{job.jm_id} 处理失败：{diagnosis.user_message}",
             )
         finally:
             await self._remove_job(self.job_key(job.jm_id, job.selection))
@@ -1392,7 +1399,10 @@ class DownloadCoordinator:
         summary = _truncate_text(summary, MAX_ERROR_SUMMARY_LENGTH)
         return summary
 
-    def _record_job_failure(self, job: Job, reason: str, exc: Exception):
+    def _record_job_failure(
+        self, job: Job, diagnosis: FailureDiagnosis, exc: Exception
+    ):
+        diagnostics = self._response_diagnostic_from_chain(exc)
         for requester in job.requesters or [Requester(None, "", "")]:
             self.store.record_event(
                 "job_failed",
@@ -1401,12 +1411,85 @@ class DownloadCoordinator:
                 jm_id=job.jm_id,
                 user_id=requester.user_id or None,
                 session=requester.session or None,
-                reason=reason,
+                reason=diagnosis.reason,
                 details={
                     "exception_type": type(exc).__name__,
                     "error": self._sanitize_error(exc),
+                    "failure_code": diagnosis.code,
+                    **diagnostics,
                 },
             )
+
+    def _diagnose_failure(self, exc: Exception, stage: str) -> FailureDiagnosis:
+        chain = _exception_chain(exc)
+        response = self._response_diagnostic_from_chain(exc)
+        exception_names = {type(item).__name__ for item in chain}
+        configured_cookies = bool(self.settings.client.get("cookies"))
+
+        if _looks_like_auth_failure(chain, response.get("status_code")):
+            if configured_cookies:
+                return FailureDiagnosis(
+                    "cookie_suspected_expired",
+                    "疑似 Cookie 失效",
+                    "站点返回了空内容或拒绝访问，Cookie 可能已失效；"
+                    "请联系管理员更新 Cookie 后重试。",
+                )
+            return FailureDiagnosis(
+                "authentication_required",
+                "需要登录或访问受限",
+                "该本子可能需要登录后访问；请联系管理员配置有效 Cookie 后重试。",
+            )
+
+        if "MissingAlbumPhotoException" in exception_names:
+            return FailureDiagnosis(
+                "album_missing_or_restricted",
+                "本子不存在或访问受限",
+                "本子不存在或当前账号无权访问；请检查 JM 号，"
+                "并让管理员确认 Cookie 是否有效。",
+            )
+
+        if "RegularNotMatchException" in exception_names:
+            return FailureDiagnosis(
+                "site_response_parse_failed",
+                "站点响应解析失败",
+                "站点返回了无法解析的内容，可能是域名变更、临时风控或登录状态异常；"
+                "请稍后重试或联系管理员。",
+            )
+
+        if any(_is_network_exception(item) for item in chain):
+            return FailureDiagnosis(
+                "network_request_failed",
+                "JM 网络请求失败",
+                "连接 JM 站点失败；请稍后重试，或联系管理员检查域名和代理。",
+            )
+
+        if any(isinstance(item, OSError) for item in chain):
+            return FailureDiagnosis(
+                "filesystem_failed",
+                "文件系统读写失败",
+                "服务器文件读写失败；请联系管理员检查磁盘空间和目录权限。",
+            )
+
+        safe_error = " ".join(self._sanitize_error(item) for item in chain).lower()
+        if _looks_like_archive_failure(safe_error):
+            return FailureDiagnosis(
+                "archive_build_failed",
+                "PDF 或压缩包生成失败",
+                "下载内容已获取，但生成 PDF 或加密压缩包失败；"
+                "请联系管理员查看 AstrBot 日志。",
+            )
+
+        if stage == "inspect":
+            return FailureDiagnosis(
+                "album_inspection_failed",
+                "章节信息获取失败",
+                "无法获取本子章节信息；请稍后重试或联系管理员查看 AstrBot 日志。",
+            )
+        return FailureDiagnosis(
+            "download_or_package_failed",
+            "下载或打包失败",
+            "下载或打包过程中发生异常；请联系管理员查看 AstrBot 日志。",
+        )
 
     def _record_request_event(self, requester: Requester, jm_id: str, mode: str):
         self.store.record_event(
@@ -1712,20 +1795,24 @@ class DownloadCoordinator:
 
     @staticmethod
     def _is_retryable_domain_error(exc: Exception) -> bool:
-        return type(exc).__name__ in {
+        retryable = {
             "MissingAlbumPhotoException",
             "RequestRetryAllFailException",
+            "RegularNotMatchException",
         }
+        return any(type(item).__name__ in retryable for item in _exception_chain(exc))
 
     def _record_domain_attempt_failure(
         self, jm_id: str, domain: str, stage: str, exc: Exception
     ):
         details = self._response_diagnostic(exc)
+        diagnosis = self._diagnose_failure(exc, stage)
         details.update(
             {
                 "candidate_domain": domain,
                 "stage": stage,
                 "exception_type": type(exc).__name__,
+                "failure_code": diagnosis.code,
             }
         )
         self.logger.warning(
@@ -1740,7 +1827,7 @@ class DownloadCoordinator:
             level="warning",
             success=False,
             jm_id=jm_id,
-            reason="候选域名无法访问该本子",
+            reason=diagnosis.reason,
             details=details,
         )
 
@@ -1754,7 +1841,9 @@ class DownloadCoordinator:
 
     @staticmethod
     def _response_diagnostic(exc: Exception) -> dict[str, Any]:
-        response = getattr(exc, "resp", None)
+        response = None
+        with suppress(Exception):
+            response = getattr(exc, "resp", None)
         if response is None:
             context = getattr(exc, "context", {})
             response = context.get("resp") if isinstance(context, dict) else None
@@ -1765,6 +1854,19 @@ class DownloadCoordinator:
             "status_code": getattr(response, "status_code", None),
             "redirect_count": int(getattr(response, "redirect_count", 0) or 0),
         }
+
+    @classmethod
+    def _response_diagnostic_from_chain(cls, exc: Exception) -> dict[str, Any]:
+        for item in _exception_chain(exc):
+            details = cls._response_diagnostic(item)
+            if (
+                details["final_domain"]
+                or details["final_path"]
+                or details["status_code"] is not None
+                or details["redirect_count"]
+            ):
+                return details
+        return cls._response_diagnostic(exc)
 
     def _validate_chapter_numbers(
         self,
@@ -2224,6 +2326,72 @@ def _group_file_path_parts(value: Any) -> tuple[str, ...]:
         part.strip()
         for part in re.split(r"[\\/]+", str(value or "").strip())
         if part.strip()
+    )
+
+
+def _exception_chain(exc: Exception) -> tuple[Exception, ...]:
+    chain: list[Exception] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while isinstance(current, Exception) and id(current) not in seen and len(chain) < 8:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return tuple(chain)
+
+
+def _exception_response_text(exc: Exception) -> str:
+    with suppress(Exception):
+        value = getattr(exc, "error_text", None)
+        if value is not None:
+            return str(value)
+    context = getattr(exc, "context", None)
+    if isinstance(context, dict):
+        return str(context.get("html", "") or "")
+    return ""
+
+
+def _is_network_exception(exc: Exception) -> bool:
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    name = type(exc).__name__.lower()
+    return name == "requestretryallfailexception" or any(
+        marker in name
+        for marker in (
+            "connectionerror",
+            "connecttimeout",
+            "readtimeout",
+            "proxyerror",
+            "sslerror",
+            "dnserror",
+            "clientconnectorerror",
+        )
+    )
+
+
+def _looks_like_auth_failure(
+    chain: tuple[Exception, ...], status_code: Any
+) -> bool:
+    if status_code in {401, 403}:
+        return True
+    for exc in chain:
+        if type(exc).__name__ != "RegularNotMatchException":
+            continue
+        response_text = _exception_response_text(exc).strip().lower()
+        if response_text in {"", "[]", "{}", "null"}:
+            return True
+        if any(
+            marker in response_text
+            for marker in ("login", "sign in", "登入", "登录", "會員", "会员")
+        ):
+            return True
+    return False
+
+
+def _looks_like_archive_failure(error: str) -> bool:
+    return any(
+        marker in error
+        for marker in ("zip", "pdf", "压缩包", "密码校验", "未生成", "没有可用图片")
     )
 
 

@@ -7,7 +7,7 @@ _✨ 在群聊或私聊中通过 JM 号下载本子，自动合并 PDF 并发送
 <img src="https://img.shields.io/badge/AstrBot-Plugin-blue" alt="AstrBot Plugin">
 <img src="https://img.shields.io/badge/AstrBot-4.26%2B-blueviolet" alt="AstrBot 4.26+">
 <img src="https://img.shields.io/badge/Python-3.12%2B-green" alt="Python">
-<img src="https://img.shields.io/badge/Version-v1.3.0-brightgreen" alt="Version v1.3.0">
+<img src="https://img.shields.io/badge/Version-v1.3.1-brightgreen" alt="Version v1.3.1">
 <img src="https://img.shields.io/badge/Archive-AES--256%20ZIP-orange" alt="AES-256 ZIP">
 
 </div>
@@ -172,6 +172,8 @@ AstrBot 全局管理员及 `plugin_admin_qq_ids` 中配置的 QQ 号可以使用
 - 确认 AstrBot 所在设备或容器可以访问目标站点。
 - 查看 AstrBot 日志中的错误信息。
 - 检查任务队列或当前会话是否已达到配置上限。
+
+域名健康检查只确认站点首页能够连通，不能证明 Cookie 仍有效或某个本子可以访问。若群聊提示“Cookie 可能已失效”，请更新 Cookie 后重试。管理页面中的候选域名发现只负责获取候选列表，以避免批量检查导致页面请求超时；应用候选域名后，再点击“立即检查域名”确认连通性。
 
 ### 浏览器能访问，但插件提示本子不存在
 

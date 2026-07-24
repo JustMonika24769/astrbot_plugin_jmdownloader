@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 PLUGIN_NAME = "astrbot_plugin_jmdownloader"
@@ -23,6 +25,45 @@ class ConfigValidation:
     config: dict[str, Any]
     errors: tuple[str, ...]
     warnings: tuple[str, ...]
+
+
+async def persist_runtime_config(
+    config: Any, updated_config: dict[str, Any]
+) -> dict[str, Any]:
+    """Persist a complete plugin config and verify the committed file when possible."""
+    desired = copy.deepcopy(updated_config)
+    config.clear()
+    config.update(desired)
+
+    async_saver = getattr(config, "save_config_async", None)
+    if callable(async_saver):
+        committed = await async_saver()
+        if committed is False:
+            raise RuntimeError("配置保存被更新的并发写入覆盖。")
+    else:
+        saver = getattr(config, "save_config", None)
+        if not callable(saver):
+            raise RuntimeError("当前 AstrBot 配置对象不支持保存。")
+        await asyncio.to_thread(saver)
+
+    config_path = str(getattr(config, "config_path", "") or "").strip()
+    if config_path:
+        saved = await asyncio.to_thread(_read_persisted_config, Path(config_path))
+        if saved != desired:
+            raise RuntimeError("配置文件内容与本次提交不一致。")
+    return desired
+
+
+def _read_persisted_config(config_path: Path) -> dict[str, Any]:
+    if not config_path.is_file():
+        raise RuntimeError("配置保存后未找到插件配置文件。")
+    try:
+        saved = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("无法读取保存后的插件配置文件。") from exc
+    if not isinstance(saved, dict):
+        raise RuntimeError("保存后的插件配置不是 JSON 对象。")
+    return saved
 
 
 def export_config(

@@ -196,10 +196,11 @@ function renderDiscoveredDomains(candidates, configuredDomains) {
     checkbox.addEventListener("change", updateApplyDomainsButton);
     choice.append(checkbox);
     const statusCell = document.createElement("td");
+    const checked = typeof candidate.healthy === "boolean";
     statusCell.append(
       statusPill(
-        candidate.healthy ? "可用" : "不可用",
-        candidate.healthy ? "success" : "failure",
+        checked ? (candidate.healthy ? "可用" : "不可用") : "未检查",
+        checked ? (candidate.healthy ? "success" : "failure") : "",
       ),
     );
     row.append(
@@ -345,7 +346,7 @@ async function checkDomains() {
 
 async function discoverDomainCandidates() {
   const button = document.getElementById("discover-domains-button");
-  setBusy(button, true, "正在发现并检查…");
+  setBusy(button, true, "正在发现…");
   elements.discoveryErrors.textContent = "";
   try {
     const result = await bridge.apiPost("domains/discover", {});
@@ -361,13 +362,17 @@ async function discoverDomainCandidates() {
         .join("\n");
     } else {
       elements.discoveryErrors.className = "validation-result success";
-      elements.discoveryErrors.textContent = "候选域名获取和健康检查均已完成。";
+      elements.discoveryErrors.textContent =
+        "候选域名获取完成。为避免页面请求超时，本次不批量检查新候选；应用后请执行域名健康检查。";
     }
     showStatus(`发现 ${result.candidates?.length || 0} 个候选域名。`);
   } catch (error) {
     elements.discoveryErrors.className = "validation-result failure";
-    elements.discoveryErrors.textContent = `发现失败：${error.message}`;
-    showStatus("域名发现失败，请检查网络和代理设置。");
+    const detail = error.message === "Network Error"
+      ? "管理页面请求超时或连接中断；这不代表已配置域名无法访问。"
+      : error.message;
+    elements.discoveryErrors.textContent = `发现失败：${detail}`;
+    showStatus("域名发现失败，请查看页面中的具体原因。");
   } finally {
     setBusy(button, false, "");
   }
@@ -385,8 +390,13 @@ async function applySelectedDomains() {
   const button = elements.applyDomainsButton;
   setBusy(button, true, "正在应用…");
   try {
-    await bridge.apiPost("domains/apply", { domains });
-    showStatus("候选域名已写入插件配置并生效。");
+    const result = await bridge.apiPost("domains/apply", { domains });
+    const appliedDomains = result.domains || [];
+    if (!result.persisted || appliedDomains.length === 0) {
+      throw new Error("后端未确认配置已经持久化。");
+    }
+    renderDiscoveredDomains(discoveredDomains, appliedDomains);
+    showStatus(`已持久化并启用 ${appliedDomains.length} 个候选域名。`);
     await refreshData();
   } catch (error) {
     showStatus(`应用域名失败：${error.message}`);

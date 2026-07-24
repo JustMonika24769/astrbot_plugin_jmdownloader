@@ -475,3 +475,63 @@ def test_download_errors_are_not_disclosed_to_chat(tmp_path):
         assert "cookie=***" in logger.errors[0]
 
     asyncio.run(scenario())
+
+
+def test_empty_album_response_is_reported_as_suspected_expired_cookie(tmp_path):
+    async def scenario():
+        settings = make_settings(
+            tmp_path,
+            client={
+                "domain": ["jm.example"],
+                "cookies": '{"AVS":"super-secret"}',
+            },
+        )
+        coordinator = jm_service.DownloadCoordinator(settings, Logger())
+        event = FakeEvent()
+        job = jm_service.Job(
+            "350234",
+            requesters=[jm_service.Requester(event, event.session)],
+        )
+
+        class RegularNotMatchException(Exception):
+            error_text = "[]"
+
+        assert coordinator._is_retryable_domain_error(
+            RegularNotMatchException("album_id parse failed")
+        )
+
+        def fail(_jm_id):
+            raise RegularNotMatchException("album_id parse failed")
+
+        coordinator.inspect_album = fail
+        await coordinator._prepare_and_download(job)
+
+        assert "Cookie 可能已失效" in event.sent[0]
+        assert "super-secret" not in event.sent[0]
+        failure = next(
+            item
+            for item in coordinator.store.list_events()
+            if item["event_type"] == "job_failed"
+        )
+        assert failure["reason"] == "疑似 Cookie 失效"
+        assert failure["details"]["failure_code"] == "cookie_suspected_expired"
+
+    asyncio.run(scenario())
+
+
+def test_failure_diagnosis_distinguishes_access_network_and_filesystem(tmp_path):
+    coordinator = jm_service.DownloadCoordinator(make_settings(tmp_path), Logger())
+
+    class MissingAlbumPhotoException(Exception):
+        pass
+
+    class RequestRetryAllFailException(Exception):
+        pass
+
+    access = coordinator._diagnose_failure(MissingAlbumPhotoException(), "inspect")
+    network = coordinator._diagnose_failure(RequestRetryAllFailException(), "inspect")
+    filesystem = coordinator._diagnose_failure(OSError("disk full"), "download")
+
+    assert access.reason == "本子不存在或访问受限"
+    assert network.reason == "JM 网络请求失败"
+    assert filesystem.reason == "文件系统读写失败"
